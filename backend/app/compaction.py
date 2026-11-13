@@ -7,22 +7,103 @@ O4：一个提问连调很多次工具时没有这样的切点，改成「Q 原�
 这里是 LLM 摘要这一级；更便宜的清旧工具结果在 microcompact，排在它前面（O9）。
 """
 
+import functools
 import json
 import logging
+import re
 from typing import Awaitable, Callable
 from uuid import UUID
 
-from app import budget, context, db, llm
+from app import budget, context, db, llm, tools
 
 log = logging.getLogger(__name__)
 
-SUMMARIZER_SYSTEM = (
-    "你是对话压缩器。把给出的对话整理成一份中文摘要，供助手继续对话时参考。"
-    "要保留：用户的目标和偏好、已经确定的结论、具体的名字/数字/ID/文件名、还没完成的事。"
-    "不要编造，不要回答对话里的问题。不超过 800 字。")
 SUMMARY_MAX_TOKENS = 4000  # 摘要调用的输出上限（要给 DeepSeek 的 thinking 留余量）
 MAX_SUMMARY_RETRIES = 3  # 摘要请求自己超窗时，缩短摘要源重试的次数
 MIN_SUMMARY_CHARS = 8  # 比这还短不像摘要
+
+# P1-C2：固定段落（参照 opencode core/src/session/compaction.ts 的 SUMMARY_TEMPLATE）。
+# 「关键标识与 ref」不让模型写，由代码从工具调用生成（with_refs），模型抄 16 位哈希会抄错
+SUMMARY_TEMPLATE = """按下面的格式写，某段没有内容就写「（无）」，不要输出 <template> 标签：
+<template>
+## 目标
+- 用户要完成什么，一两句
+## 约束与偏好
+- 用户明确提出的要求、偏好、范围边界
+## 已定决定
+- 已经确定的结论和理由
+## 进度
+### 已完成
+### 进行中
+### 受阻
+## 下一步
+1. 按顺序列出
+## 未回答的用户请求
+- 还没答复、或还要继续做的用户请求，保留原话；已经答复的不写
+</template>
+规则：每段用简短的单行要点；名字、数字、ID、文件名、URL 原样保留；不要编造；不要写「关键标识与 ref」这一段，系统会自动补上；\
+不要提到压缩或摘要过程。"""
+# 增量合并（opencode 的 update prompt）：旧摘要 + 新历史 → 一份，新的优先，没被推翻的照抄，不整篇重写
+MERGE_RULES = ("开头 <summary> 里是之前的摘要。把它和之后的对话合并成一份新摘要：新信息优先；旧摘要里没有被推翻、解决或过时的内容原样保留；"
+               "做完的事从「进行中」挪到「已完成」，已经答复的请求从「未回答的用户请求」里删掉。")
+SUMMARIZER_SYSTEM = "你是对话压缩器。把给出的对话整理成结构化的中文摘要，供助手继续对话时参考，不要回答对话里的问题。\n" + SUMMARY_TEMPLATE
+
+
+# P1-C1：摘要请求复用正常请求的前缀，压缩指令代替运行时尾部。只能写在指令里，不能设 tool_choice none：
+# 11-03 实测 none 会让 DeepSeek 把工具定义从 prompt 里拿掉，后面整段历史 0 命中
+def compact_note(merge: bool, retry: bool = False) -> str:
+    """merge：有旧摘要时用合并规则；retry：上一次调了工具，补一句更强的提醒（C1 选 A）。"""
+    return ("<compact_request>" + ("上一次你调用了工具，压缩阶段不执行工具，这一次只输出摘要正文。" if retry else "")
+            + "请暂停当前任务，不要调用任何工具，也不要回答对话里的问题。"
+            + (MERGE_RULES if merge else "把以上对话整理成结构化摘要，供你之后继续工作时参考。")
+            + "\n" + SUMMARY_TEMPLATE + "\n只输出摘要正文。</compact_request>")
+
+
+REFS_HEADING = "## 关键标识与 ref"
+MAX_REFS = 30  # 只留最近的 30 条调用，旧的丢掉（摘要不能无限长）
+_REF = re.compile(r"ref=(out_[0-9a-f]{16})")
+
+
+def tool_log(messages: list[dict]) -> list[str]:
+    """从摘要源的原文里逐个读工具调用：真名 + 入参，结果被截断过带 ref，失败标「失败」。同样的消息永远得到同样的行。"""
+    results = {b.get("tool_use_id"): b for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+               for b in m["content"] if b.get("type") == "tool_result"}
+    lines = []
+    for m in messages:
+        for b in m["content"] if m["role"] == "assistant" and isinstance(m["content"], list) else []:
+            if b.get("type") != "tool_use":
+                continue
+            name, args = b.get("name"), b.get("input")
+            if name == tools.CALL_TOOL and isinstance(args, dict) and isinstance(args.get("tool_name"), str):
+                name, args = args["tool_name"], args.get("arguments")  # 延迟工具：记真名
+            if name == tools.READ_TOOL:  # 回取本身不是新信息，ref 已经在发起它的那一行里
+                continue
+            arg_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+            line = f"- {name} {arg_text[:120] + '…' if len(arg_text) > 120 else arg_text}"
+            r = results.get(b.get("id"))
+            text = str(r.get("content")) if r else ""
+            if r and (r.get("is_error") or text.startswith(tools.ERROR_PREFIX)):
+                line += " → 失败"
+            elif ref := _REF.search(text):
+                line += f" → ref={ref.group(1)}"
+            lines.append(line)
+    return lines
+
+
+def split_refs(summary: str | None) -> tuple[str, list[str]]:
+    """拆成（模型写的部分, ref 段的行）。ref 段总在最后。"""
+    head, _, tail = (summary or "").partition(REFS_HEADING)
+    return head.strip(), [ln for ln in tail.splitlines() if ln.startswith("- ")]
+
+
+def with_refs(model_text: str, old_summary: str | None, source: list[dict]) -> str:
+    """模型写的 ref 段整段丢掉；旧摘要的 ref 段 + 这次摘要源的调用 → 去重（留最后一次）、保序、只留最近 MAX_REFS 条。"""
+    body, _ = split_refs(model_text)
+    lines = split_refs(old_summary)[1] + tool_log(source)
+    merged = list(reversed(dict.fromkeys(reversed(lines))))[-MAX_REFS:]
+    return f"{body}\n\n{REFS_HEADING}\n" + "\n".join(merged) if merged else body
+# (旧摘要, 摘要源, 压缩指令) → {"system", "messages", "tools"}：由循环提供，和它的正常请求同一套拼法
+Prompt = Callable[[str | None, list[dict], str], dict]
 
 
 class SummaryIncomplete(Exception):
@@ -113,13 +194,45 @@ def render(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def summarize(old_summary: str | None, messages: list[dict]) -> str:
-    prefix = f"之前的摘要：\n{old_summary}\n\n之后的对话：\n" if old_summary else "对话：\n"
-    text, stop = await llm.complete_with_stop(system=SUMMARIZER_SYSTEM, prompt=prefix + render(messages),
-                                              max_tokens=SUMMARY_MAX_TOKENS)
+def _checked(text: str, stop: str | None) -> str:
     if stop != "end_turn" or len(text) < MIN_SUMMARY_CHARS:
         raise SummaryIncomplete(f"stop_reason={stop}, {len(text)} chars")
     return text
+
+
+async def summarize_alone(old_summary: str | None, messages: list[dict]) -> str:
+    """单独摘要器：自己的 system + 渲染成纯文本，和正常请求没有公共前缀（缓存 0 命中）。C1 起只做退路。"""
+    prefix = f"<summary>\n{old_summary}\n</summary>\n{MERGE_RULES}\n\n之后的对话：\n" if old_summary else "对话：\n"
+    text, stop = await llm.complete_with_stop(system=SUMMARIZER_SYSTEM, prompt=prefix + render(messages),
+                                              max_tokens=SUMMARY_MAX_TOKENS)
+    return _checked(text, stop)
+
+
+async def summarize(old_summary: str | None, messages: list[dict], prompt: Prompt | None = None,
+                    stats: dict | None = None) -> str:
+    """C1：同 system、同 tools、tool_choice auto，只把运行时尾部换成压缩指令。
+    模型去调工具 → 丢掉这次回复，换更强的指令重发一次（前缀不变，仍命中）→ 还调就退回单独摘要器。
+    没有 prompt（单元测试直接调 compactor）就只走单独摘要器。
+    C7：stats 记走了哪条路（prefix / retry / alone）和摘要请求自己的 usage（单独摘要器拿不到 usage）。"""
+    stats = {} if stats is None else stats
+    stats["mode"] = "alone"
+    stats.setdefault("usages", [])  # 摘要请求自己超窗、缩短重试时会调几次，usage 累加
+    if prompt is None:
+        return await summarize_alone(old_summary, messages)
+    for retry in (False, True):
+        note = compact_note(merge=bool(old_summary), retry=retry)
+        req = prompt(old_summary, messages, note)
+        final = None
+        async for ev in llm.stream_message(system=req["system"], messages=req["messages"], tools=req["tools"],
+                                           tool_choice={"type": "auto"}):
+            if ev["type"] == "final":
+                final = ev
+        stats["usages"].append(final.get("usage") or {})
+        if final["stop_reason"] != "tool_use":  # 调了工具的回复一个字都不用：不执行、不进请求、不进摘要
+            stats["mode"] = "retry" if retry else "prefix"
+            return _checked(context.text_of(final["content"]).strip(), final["stop_reason"])
+        log.warning("summary request answered with tool_use (%s)", "fallback" if retry else "retrying")
+    return await summarize_alone(old_summary, messages)
 
 
 def summary_budget() -> int:
@@ -154,8 +267,37 @@ def strip_usage(history: list[dict]) -> list[dict]:
     return [{**m, "usage": None} for m in history]
 
 
+MIN_PROGRESS = 0.1  # C4：压完至少省 10%
+FALLBACK_HEADING = "## 降级记录（模型摘要失败，由代码按原话生成，未经整理）"
+USER_CHARS, ANSWER_CHARS = 2000, 800  # 降级记录里每条用户原话 / 每轮回答最多留多少字（粘贴整篇文档时不能让它自己超窗）
+
+
+def _clip(text: str, n: int) -> str:
+    return text if len(text) <= n else f"{text[:n]}……（后面还有 {len(text) - n} 字，原文可用 recall 搜）"
+
+
+def fallback_summary(old_summary: str | None, messages: list[dict]) -> str:
+    """C4（Cline 的 basic 策略）：不调模型。旧摘要正文原样留着；之后每个回合留用户原话 + 这一回合最后一条有字的回答，
+    工具调用和结果全删（ref 段由 with_refs 另补）。下次模型摘要成功时，它是「旧摘要」，按 C2 的规则合并进去。"""
+    lines, answer = [], None
+
+    def flush():
+        if answer:
+            lines.append(f"- 助手：{_clip(answer, ANSWER_CHARS)}")
+    for m in messages:
+        if is_real_user(m):
+            flush()
+            lines.append(f"- 用户：{_clip(context.text_of(m['content']), USER_CHARS)}")
+            answer = None
+        elif m["role"] == "assistant" and (t := context.text_of(m["content"]).strip()):
+            answer = t  # 同一回合里后面的覆盖前面的：只留最后一条
+    flush()
+    body = split_refs(old_summary)[0]
+    return (f"{body}\n\n" if body else "") + FALLBACK_HEADING + "\n" + "\n".join(lines)
+
+
 Measure = Callable[[str | None, list[dict]], int]  # (摘要, 历史) → 整份请求的估算 token，由循环提供
-Compactor = Callable[[list[dict], str | None, int, Measure], Awaitable[tuple[str, list[dict]] | None]]
+Compactor = Callable[..., Awaitable[tuple[str, list[dict]] | None]]  # (历史, 摘要, 额度, measure, prompt=)
 
 
 def make_compactor(conversation_id: UUID, revision: int,
@@ -164,7 +306,9 @@ def make_compactor(conversation_id: UUID, revision: int,
     O4：压缩是投机修改，采用规则（整份请求变小、配对完整、保护区逐字不变）全部满足才提交或返回。"""
     state = {"revision": revision}
 
-    async def compact(history: list[dict], summary: str | None, limit: int, measure: Measure):
+    async def compact(history: list[dict], summary: str | None, limit: int, measure: Measure,
+                      prompt: Prompt | None = None, raw: list[dict] | None = None, fallback: bool = False):
+        stats = compact.stats = {}  # C7：这次压缩走了哪条路、摘要请求的 usage；循环把它并进 compacted 事件
         start, q = current_question(history)
         k = choose_cut(history, limit)
         if k is None and 0 < start == q:
@@ -184,19 +328,28 @@ def make_compactor(conversation_id: UUID, revision: int,
         j, retries = fit_source(summary, history, end), 0
         while j > 0:  # 耗时几秒，不在事务里；运行时才查 summarize，测试可以替换
             try:
-                new_summary = await (summarize_fn or summarize)(summary, history[:j])
+                fn = summarize_fn or functools.partial(summarize, prompt=prompt, stats=stats)
+                new_summary = await fn(summary, history[:j])
+                # C2：ref 段由代码生成。history 可能是 O9 投影（占位符里没有 ref），从原文 raw 读，两者一一对应
+                new_summary = with_refs(new_summary, summary, (raw or history)[:j])
                 break
             except (llm.LLMError, SummaryIncomplete) as e:  # 摘要失败不等于 run 失败：这次不压、照发
                 retries += 1  # 只有摘要请求自己超窗值得再试：缩短摘要源
                 overflow = llm.classify_error(e) == "context_overflow" and retries <= MAX_SUMMARY_RETRIES
                 j = snap_cut(history, j - max(1, j // 5)) if overflow else 0
                 log.warning("conversation %s summary failed (%s), retry=%s", conversation_id, e, j > 0)
+        if j == 0 and fallback and end > 0:  # C4：模型摘要失败、请求已经超窗：不调模型，确定性降级，同样验收和落库
+            j = end
+            new_summary = with_refs(fallback_summary(summary, history[:end]), summary, (raw or history)[:end])
+            stats.update(mode="fallback")
+            log.warning("conversation %s summary failed, using deterministic fallback", conversation_id)
         if j == 0:
             return None
         prefix = [history[q]] if q is not None and q < j else []  # Q 被推迟时它本来就在原文里
         kept, cursor = prefix + history[j:], history[j]
         before, after = measure(summary, history), measure(new_summary, kept)
-        if not (after < before and accepts(kept, protected)):  # 先验收再提交：不采用的摘要不能留在库里
+        # C4 最小进展守卫（OpenHands minimum_progress）：省不到 10% 不压，白丢缓存、下一轮还要再压
+        if not (after <= before * (1 - MIN_PROGRESS) and accepts(kept, protected)):  # 先验收再提交
             log.warning("conversation %s compaction rejected: %s -> %s tokens", conversation_id, before, after)
             return None
         if cursor.get("id") is None:  # 游标还没落库（测试里绕过 runner 直接跑循环）：只在本 run 内生效
@@ -215,4 +368,5 @@ def make_compactor(conversation_id: UUID, revision: int,
             return None
         return won["summary"], strip_usage(kept)
 
+    compact.stats = {}
     return compact

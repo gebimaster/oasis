@@ -191,7 +191,12 @@ async def main(args) -> None:
             for category, env in SPECIAL_ENV.items():
                 special = [c for c in cases if c["category"] == category]
                 if cfg == "A" and special:
-                    records += await run_config(cfg, env, special, args.trials, log)
+                    recs = await run_config(cfg, env, special, args.trials, log)
+                    if category == "compaction":  # P1-C7 成对对照：同样的题在默认窗口（不会压缩）下再跑一遍
+                        ctrl = await run_config(cfg, {}, special, args.trials, log)
+                        recs = [r | {"variant": "compact"} for r in recs] + \
+                               [r | {"variant": "control", "config": "A-对照"} for r in ctrl]  # 不进 A 的主表
+                    records += recs
     snapshot = {"time": stamp, "model": MODEL, "judge_model": JUDGE_MODEL, "trials": args.trials,
                 "parallel": PARALLEL, "configs": {k: CONFIGS[k] for k in args.configs.split(",")},
                 "compaction_env": COMPACT_ENV, "truncation_env": TRUNC_ENV, "dataset_sha": sha(CASES), "n_cases": len(cases),

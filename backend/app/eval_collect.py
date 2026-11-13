@@ -105,5 +105,11 @@ async def collect(pg, conversation_id: UUID, user_id: UUID, model: str) -> tuple
                                       for r in runs if r["finished_at"]), 2),
                "usage": usage, "cost_usd": round(cost_usd(usage, model), 6), "tool_calls": len(calls),
                "run_ids": [str(r["id"]) for r in runs],  # 每个 run 一棵 trace，结果页点进去
-               "runs": [_run_metrics(r, per_run.get(r["id"], []), model) for r in runs]}
+               "runs": [_run_metrics(r, per_run.get(r["id"], []), model) for r in runs],
+               # P1-C7：压缩后靠检索找回原文的次数（2608.16370：压缩时成功率不变、检索调用暴涨）和每次压缩的记录
+               "recall_calls": sum(c["name"] == "recall" for c in calls),
+               "read_output_calls": sum(c["name"] == "read_tool_output" for c in calls),
+               "compactions": [r["data"] for r in await pg.fetch(
+                   "SELECT data FROM run_events WHERE run_id = ANY($1::uuid[]) AND type = 'compacted' ORDER BY run_id, seq",
+                   [r["id"] for r in runs])]}
     return trial, metrics

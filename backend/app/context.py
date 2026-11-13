@@ -113,10 +113,12 @@ def final_answer(messages: list[dict]) -> str:
 def build_request(*, user_name: str, summary: str | None, history: list[dict],
                   now: datetime, final_turn: bool, catalog: str = "",
                   loaded_defs: list[dict] | None = None,
-                  persona: str = PERSONA, notes: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+                  persona: str = PERSONA, notes: list[str] | None = None,
+                  instruction: str | None = None) -> tuple[list[dict], list[dict]]:
     """返回 (system blocks, messages)。history 的元素可带 status 字段，这里负责剥掉。
     catalog 是延迟工具名录；loaded_defs 是本会话已加载工具的完整定义；persona 给子智能体换成合同（M7）。
-    notes 是循环给的运行时提示（O6 的重复提醒），拼在尾部最后。"""
+    notes 是循环给的运行时提示（O6 的重复提醒），拼在尾部最后。
+    instruction（P1-C1）：压缩摘要请求用，代替层4 的运行时尾部；前面三层和正常请求逐字相同，前缀缓存才能命中。"""
     # 层1：内容固定，最后一轮也不改它，否则后面整段历史的缓存全部失效
     system = [{"type": "text", "text": t} for t in (PLATFORM, TOOL_GUIDE, persona)]
 
@@ -139,6 +141,14 @@ def build_request(*, user_name: str, summary: str | None, history: list[dict],
             note = INTERRUPTED_NOTE if m["status"] == "interrupted" else STOPPED_NOTE
             content = _as_blocks(content) + [{"type": "text", "text": note}]
         msgs.append({"role": m["role"], "content": content})
+
+    if instruction is not None:  # 摘要请求：最后是 user（tool_result / 提问）就接在同一条里，是 assistant 就新起一条
+        last = msgs[-1]
+        if last["role"] == "user":
+            msgs[-1] = {"role": "user", "content": _as_blocks(last["content"]) + [{"type": "text", "text": instruction}]}
+        else:
+            msgs.append({"role": "user", "content": [{"type": "text", "text": instruction}]})
+        return system, msgs
 
     # 层4：拼到最后一条 user 的末尾（tool_result 之后放 text 也合法，已实测）
     tail = (f"---\n当前时间：{now:%Y-%m-%d %H:%M} (UTC{now:%z})" + (FINAL_TURN_NOTE if final_turn else "")

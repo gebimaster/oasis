@@ -83,7 +83,7 @@ def test_loop_clears_before_summarizing_and_reports_tokens():
     h = history(8)
     summarized = []
 
-    async def compactor(*a):
+    async def compactor(*a, **kw):
         summarized.append(1)
         return None
 
@@ -138,7 +138,7 @@ def test_stale_usage_is_dropped_after_clearing():
     h[-2]["usage"] = {"input_tokens": total, "output_tokens": 10}  # 最近一条 assistant 带着清理前的大 usage
     summarized = []
 
-    async def compactor(*a):
+    async def compactor(*a, **kw):
         summarized.append(1)
         return None
 
@@ -188,7 +188,7 @@ def test_summary_tier_sizes_and_summarizes_the_projection():
     h = history(8)
     seen = {}
 
-    async def compactor(hist, summary, room, measure):
+    async def compactor(hist, summary, room, measure, **kw):
         seen["n_cleared"] = sum(1 for x in results(hist) if x.startswith("[已清理"))
         return "摘要", hist[-4:]
 

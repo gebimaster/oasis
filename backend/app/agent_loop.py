@@ -133,23 +133,36 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                       else context.REPEAT_NOTE).format(name=name, n=n) for name, n, polling in repeats.nudges()]
         final = None
 
-        def build(s, h):  # 每轮都重新拼：history 在变，时间在变；最后一轮的提示、重复提醒都进尾部，不动 system
-            return context.build_request(user_name=user_name, summary=s,
-                                         history=microcompact.project(h, cleared_until),  # O9：确定的投影
+        def shape(s, h, instruction=None):  # 每轮都重新拼：history 在变，时间在变；最后一轮的提示、重复提醒都进尾部，不动 system
+            return context.build_request(user_name=user_name, summary=s, history=h,
                                          now=now(), final_turn=last, catalog=tools.deferred_catalog(),
                                          loaded_defs=tools.definitions(tools.context().loaded), persona=persona,
-                                         notes=notes)
+                                         notes=notes, instruction=instruction)
 
-        async def compact(h, s, room):
+        def build(s, h):
+            return shape(s, microcompact.project(h, cleared_until))  # O9：确定的投影
+
+        def prompt(s, h, instruction):
+            """P1-C1：摘要请求和正常请求同一套拼法、同一份 tools，只把尾部换成压缩指令。
+            h 是 compact 交给 compactor 的那份（已投影过），不再投影：再投影一次字节会变，前缀就对不上了。"""
+            sys_, msgs = shape(s, h, instruction)
+            return {"system": sys_, "messages": msgs, "tools": tool_defs}
+
+        async def compact(h, s, room, **kw):  # kw：C4 的 fallback 只在超窗恢复时给
             """O9 复核③：摘要那一级按投影量长度、做摘要（清掉的结果模型本来就看不到，不该再按原文切、再喂给摘要），
             返回的保留部分按 id 换回原文：循环里的 history 必须是原文，投影只在拼请求时做（占位符再投影一次字节会变）。"""
             if not cleared_until:
-                return await compactor(h, s, room, measure)
+                return await compactor(h, s, room, measure, prompt=prompt, **kw)
             raw = {m["id"]: m for m in h if m.get("id") is not None}
-            res = await compactor(microcompact.project(h, cleared_until), s, room, measure)
+            # C2：原文一起交过去，ref 段从原文生成（占位符里没有 ref）；project 一一对应，下标对得上
+            res = await compactor(microcompact.project(h, cleared_until), s, room, measure, prompt=prompt, raw=h, **kw)
             if not res:
                 return res
             return res[0], [{**raw[m["id"]], "usage": None} if m.get("id") in raw else m for m in res[1]]
+
+        def compact_stats():  # C7：这次压缩走了哪条路、摘要请求自己的命中率（单独摘要器 / 降级没有 usage，记 None）
+            st = getattr(compactor, "stats", None) or {}
+            return {"mode": st.get("mode"), "summary_hit_rate": budget.hit_rate(st.get("usages") or [])}
 
         def measure(s, h):  # O4：整份请求的本地估算，采用规则和留额度都用它（名录、loaded_defs 都在里面）
             sys_, msgs = build(s, h)
@@ -177,7 +190,7 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                 summary, history = result
                 yield {"type": "compacted", "reason": "trigger", "kept_messages": len(history),
                        "summary_chars": len(summary),
-                       "tokens_before": before, "tokens_after": measure(summary, history)}
+                       "tokens_before": before, "tokens_after": measure(summary, history), **compact_stats()}
                 system, request_msgs = build(summary, history)
         emitted = False  # O7 水位：这次调用推出过文字没有
         try:
@@ -216,14 +229,15 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                 # 先强制压缩（不占 MAX_COMPACTIONS），压不下来再临时截窗口（不摘要、不落库）
                 room = limits["target"] - measure("-", []) - budget.SUMMARY_RESERVE
                 use = compactor and not windowed
-                result, reason = (await compact(history, summary, room) if use else None), "overflow"
+                result, reason = (await compact(history, summary, room, fallback=True) if use else None), "overflow"
                 if result is None and (window := compaction.temporary_window(history)):
                     result, reason, windowed = (summary, window), "window", True
                 if result:  # 请求变了才重发；没变的话服务端检查是确定性的，原样重发必然同样 400
                     summary, history = result
                     yield {"type": "compacted", "reason": reason, "kept_messages": len(history),
                            "summary_chars": len(summary or ""), "tokens_before": before,
-                           "tokens_after": measure(summary, history)}
+                           "tokens_after": measure(summary, history),
+                           **(compact_stats() if reason == "overflow" else {"mode": "window", "summary_hit_rate": None})}
                     turn -= 1
                     continue
             yield {"type": "run_end", "status": "failed", "stop_reason": kind, "error": str(e)}

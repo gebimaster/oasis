@@ -211,7 +211,7 @@ REPEAT5 = [([rep(i)], "tool_use") for i in range(1, 6)]
 def recording_compactor(result=lambda history, summary: ("摘要", history[-1:])):
     calls = []
 
-    async def compactor(history, summary, room, measure):
+    async def compactor(history, summary, room, measure, **kw):
         calls.append(len(history))
         return result(history, summary)
     return compactor, calls
@@ -311,7 +311,7 @@ def test_compactions_capped_per_run():
     tools.current.set(tools.ToolContext(permissions=frozenset({"weather:read"})))
     attempts = []
 
-    async def compactor(*args):
+    async def compactor(*args, **kw):
         attempts.append(1)
         return None  # 压不下来：每轮都还在线上
     stream, calls = fake_model([([CALL], "tool_use"), ([CALL2], "tool_use"), ([{**CALL, "id": "t3"}], "tool_use"), TEXT])

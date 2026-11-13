@@ -61,7 +61,7 @@ def test_compaction_end_to_end(monkeypatch):
         before = await db.list_messages(cid)
 
         seen = []
-        async def fake_summarize(old, msgs):
+        async def fake_summarize(old, msgs, **kw):
             seen.append(msgs)
             return "摘要：用户问过北京天气"
         monkeypatch.setattr(compaction, "summarize", fake_summarize)
@@ -90,7 +90,9 @@ def test_compaction_end_to_end(monkeypatch):
         # 第二个 run：从水位加载，前面换成摘要
         run2 = await db.start_run(cid, [{"type": "text", "text": "第5个问题"}])
         await runner._run(cid, run2, model_stream=stream, limits={"trigger": 10**9, "target": 10**9})
-        assert calls[1]["messages"][1]["content"].startswith("<summary>\n摘要：用户问过北京天气\n</summary>")
+        # C2：摘要末尾是代码生成的 ref 段，落库后下个 run 原样带上
+        assert calls[1]["messages"][1]["content"].startswith(
+            "<summary>\n摘要：用户问过北京天气\n\n## 关键标识与 ref\n- get_weather {\"city\": \"城市1\"}\n")
         assert calls[1]["messages"][2]["content"][0]["text"] == kept_first["content"][0]["text"]
     with_fresh_db(body)
 
@@ -110,7 +112,7 @@ def test_stale_usage_ignored_after_compaction(monkeypatch):
             calls.append(kw)
             yield {"type": "final", "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
 
-        async def explode(*_):
+        async def explode(*_, **kw):
             raise AssertionError("不该再次压缩")
         monkeypatch.setattr(compaction, "summarize", explode)
         run2 = await db.start_run(cid, [{"type": "text", "text": "q2"}])
@@ -185,7 +187,7 @@ def test_single_round_keeps_question_and_last_group():
     history = single_round()
     seen = []
 
-    async def fake_summarize(old, msgs):
+    async def fake_summarize(old, msgs, **kw):
         seen.append(msgs)
         return "摘要：已查 7 个城市"
     compact = make_compactor(uuid4(), 0, fake_summarize)  # 随便一个会话 id：这条路径不碰数据库
@@ -237,7 +239,7 @@ def test_single_round_compaction_in_loop():
     """循环里：请求排成 会话上下文 → 摘要 → Q → A8 → R8，压缩事件带前后 token 数。"""
     history = single_round()
 
-    async def fake_summarize(old, msgs):
+    async def fake_summarize(old, msgs, **kw):
         return "摘要：已查 7 个城市"
     stream, calls = fake_model(["对比完了"])
 
@@ -264,7 +266,7 @@ def test_long_summary_not_committed(monkeypatch):
                 await db.insert_message(cid, run_id, m["role"], m["content"])
             await db.finish_run(run_id, "completed", "end_turn")
 
-        async def long_summarize(old, msgs):
+        async def long_summarize(old, msgs, **kw):
             return "很长的摘要" * 2000  # 1 万字，比被压掉的 3 轮原文（约 6600 token）还长
         monkeypatch.setattr(compaction, "summarize", long_summarize)
         run_id = await db.start_run(cid, [{"type": "text", "text": "第4个问题"}])
@@ -293,7 +295,7 @@ def test_room_counts_loaded_defs(monkeypatch):
                 await db.insert_message(cid, run_id, m["role"], m["content"])
             await db.finish_run(run_id, "completed", "end_turn")
 
-        async def fake_summarize(old, msgs):
+        async def fake_summarize(old, msgs, **kw):
             return "摘要"
         monkeypatch.setattr(compaction, "summarize", fake_summarize)
         monkeypatch.setattr(tools, "definitions", lambda names: DEFS)
@@ -318,7 +320,7 @@ def test_single_round_compaction_persists_and_restores(monkeypatch):
         _, cid = await _conversation()
         q1 = [{"type": "text", "text": "帮我对比 8 个城市的天气"}]
 
-        async def fake_summarize(old, msgs):
+        async def fake_summarize(old, msgs, **kw):
             return "摘要：已查前几个城市"
         monkeypatch.setattr(compaction, "summarize", fake_summarize)
 
@@ -343,7 +345,7 @@ def test_single_round_compaction_persists_and_restores(monkeypatch):
         assert cursor["role"] == "assistant" and cursor["run_id"] == run1    # 游标指向本 run 新产生的消息
         assert (await db.get_run(run1))["status"] == "completed"
 
-        async def explode(*_):
+        async def explode(*_, **kw):
             raise AssertionError("水位已经落库，下个 run 不该再摘要")
         monkeypatch.setattr(compaction, "summarize", explode)
         run2 = await db.start_run(cid, [{"type": "text", "text": "哪个最热？"}])
@@ -378,7 +380,7 @@ def test_summary_source_deferred_when_over_budget(monkeypatch):
     history = single_round()
     seen = []
 
-    async def fake_summarize(old, msgs):
+    async def fake_summarize(old, msgs, **kw):
         seen.append(msgs)
         return "摘要：已查前 3 个城市"
     summary, kept = asyncio.run(make_compactor(uuid4(), 0, fake_summarize)(history, None, 500, measure))
@@ -432,7 +434,7 @@ def test_summary_failure_does_not_crash_run(monkeypatch):
 
         attempts = []
 
-        async def broken(old, msgs):
+        async def broken(old, msgs, **kw):
             attempts.append(1)
             raise api_error(anthropic.InternalServerError, 500, {"error": {"message": "summarizer down"}})
         monkeypatch.setattr(compaction, "summarize", broken)

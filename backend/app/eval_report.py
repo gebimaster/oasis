@@ -11,7 +11,7 @@
 """
 
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from app.budget import hit_rate
 from app.eval_grade import pass_metrics
@@ -36,6 +36,51 @@ def citation_summary(records: list[dict]) -> dict:
             "citations_total": f'{sum(c["n"] for _, c in pairs)}/{sum(c["unchecked"] for _, c in pairs)}',
             "faithful_x_citation": grid if pairs else None}
 
+
+def _avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 3) if xs else None
+
+
+def compaction_pairs(records: list[dict]) -> dict | None:
+    """P1-C7（ACON 2510.00615 的成对样本）：压缩题在「小窗口、会压缩」和「大窗口、不压缩」下各跑 k 次，
+    并排比通过率、检索调用、命中率；再按 (题, trial) 配对，列出压缩那边失败、对照那边成功的样本，逐个看摘要丢了什么。
+    同一个 trial 序号的两次是独立抽样，配对只为挑出可对照的样本，不是同一次随机性下的对比。"""
+    ok = [r for r in records if r["category"] == "compaction" and not r.get("env_error")]
+    comp, ctrl = ([r for r in ok if r.get("variant") == v] for v in ("compact", "control"))
+    if not comp or not ctrl:
+        return None
+
+    def side(rs):
+        return {"pass@1": _avg([float(r["passed"]) for r in rs if r.get("passed") is not None]),
+                "recall_avg": _avg([r.get("recall_calls") for r in rs]),
+                "read_output_avg": _avg([r.get("read_output_calls") for r in rs]),
+                "hit_rate": hit_rate([r["usage"] for r in rs]), "tokens_avg": _avg([sum(r["usage"].values()) for r in rs])}
+    events = [c for r in comp for c in r.get("compactions", [])]
+    by_key = {(r["case"], r.get("trial")): r for r in ctrl}
+    regressions = [(r, by_key[(r["case"], r.get("trial"))]) for r in comp if r.get("passed") is False
+                   and by_key.get((r["case"], r.get("trial")), {}).get("passed") is True]
+    return {"compact": side(comp), "control": side(ctrl), "n_compactions": len(events),
+            "modes": dict(Counter(str(c.get("mode")) for c in events)),
+            "ratio_avg": _avg([c["tokens_after"] / c["tokens_before"] for c in events if c.get("tokens_before")]),
+            "summary_hit_avg": _avg([c.get("summary_hit_rate") for c in events]),
+            "regressions": [{"case": a["case"], "trial": a.get("trial"), "compact": a.get("answer", ""),
+                             "control": b.get("answer", "")} for a, b in regressions]}
+
+
+def compaction_section(p: dict | None) -> list[str]:
+    if p is None:
+        return []
+    rows = [("pass@1", "pass@1"), ("平均 recall 调用 / 题", "recall_avg"),
+            ("平均 read_tool_output 调用 / 题", "read_output_avg"), ("缓存命中率", "hit_rate"), ("平均 token / 题", "tokens_avg")]
+    lines = ["", "## 压缩对照（P1-C7）", "", "| 指标 | 会压缩（小窗口） | 不压缩（对照，默认窗口） |", "|---|---|---|"]
+    lines += [f"| {label} | {p['compact'][k]} | {p['control'][k]} |" for label, k in rows]
+    lines += ["", f"压缩 {p['n_compactions']} 次，走法 {p['modes']}（prefix 一次成功 / retry 重试后成功 / alone 退回单独摘要器 / "
+              f"fallback 降级 / window 截窗口），平均压缩比 {p['ratio_avg']}，摘要请求平均命中率 {p['summary_hit_avg']}。",
+              "", "### 压缩后失败、不压缩成功", ""]
+    lines += [f"- {x['case']}#{x['trial']}：压缩「{x['compact'][:80]}」｜对照「{x['control'][:80]}」"
+              for x in p["regressions"]] or ["（无）"]
+    return lines
 
 def summarize(records: list[dict]) -> dict:
     by_case = defaultdict(list)
@@ -106,4 +151,5 @@ def report(snapshot: dict, records: list[dict]) -> str:
               f"{u['cost_usd']} | {'无输入' if u['hit_rate'] is None else u['hit_rate']} |"
               for r in sorted(records, key=lambda r: (r["config"], r["case"], r.get("trial", 0)))
               for u in r.get("runs", [])]
+    lines += compaction_section(compaction_pairs(records))
     return "\n".join(lines) + "\n"
