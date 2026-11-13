@@ -1,0 +1,30 @@
+[project]
+name = "oasis-backend"
+version = "0.1.0"
+description = "oasis：在线多用户 Agent 服务（学习项目）"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.3.0",
+    "asyncpg>=0.32.0",
+    "chromadb==1.5.9",
+    "e2b==2.50.0",
+    "e2b-code-interpreter==2.10.0",
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "jieba>=0.42.1",
+    "jsonschema>=4.26.0",
+    "mcp>=2.3.0",
+    "openai>=3.48.0",
+    "python-dotenv>=1.2.4",
+    "rank-bm25>=0.2.2",
+    "uvicorn>=0.54.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

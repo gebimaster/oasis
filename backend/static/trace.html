@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oasis trace</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#888; --line:#e3e3e3; --run:#5c6bc0; --llm:#26a69a; --tool:#ffa726;
+          --err:#c62828; --hl:#fff7d6; --panel:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --fg:#e6e6e6; --muted:#999; --line:#2c2f36; --hl:#3a3420; --panel:#1f2227; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  .meta { color:var(--muted); font-size:13px; margin-bottom:8px; }
+  .row { display:grid; grid-template-columns:minmax(220px, 34%) 1fr 70px; gap:8px; align-items:center;
+         padding:3px 4px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .row.focus { background:var(--hl); }
+  .name { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .kind { display:inline-block; width:34px; font:11px ui-monospace, monospace; color:var(--muted); }
+  .st { font-size:12px; margin-left:4px; } .st.error, .st.interrupted { color:var(--err); } .st.cancelled { color:var(--muted); }
+  .track { position:relative; height:14px; }
+  .bar { position:absolute; top:2px; height:10px; border-radius:2px; opacity:.85; }
+  .bar.run { background:var(--run); } .bar.llm { background:var(--llm); } .bar.tool { background:var(--tool); }
+  .bar.error, .bar.interrupted { outline:2px solid var(--err); }
+  .dur { text-align:right; font:12px ui-monospace, monospace; color:var(--muted); }
+  .sum { grid-column:1 / -1; font-size:12px; color:var(--muted); padding-left:40px; }
+  pre { grid-column:1 / -1; margin:4px 0 8px; padding:8px; background:var(--panel); border:1px solid var(--line);
+        font:12px/1.45 ui-monospace, monospace; white-space:pre-wrap; word-break:break-all; max-height:360px; overflow:auto; }
+  .err { color:var(--err); }
+  @media (max-width:640px) { .row { grid-template-columns:1fr 60px; } .track { grid-column:1 / -1; order:3; } }
+</style>
+</head>
+<body>
+<main>
+  <h2>Trace</h2>
+  <div class="meta" id="meta">加载中…</div>
+  <div id="rows"></div>
+</main>
+<script type="module">
+import { bar, bounds, flatten, summary } from "/static/trace.js";
+
+const q = new URLSearchParams(location.search);
+const run = q.get("run");
+// 评测页把一次性 token 放进 sessionStorage 再跳过来，不放 URL；手动打开时退回 ?token= 或 demo
+let token = q.get("token") || "demo-token";
+try { token = sessionStorage.getItem(`eval-token:${run}`) || token; } catch {}
+
+async function load() {
+  const r = await fetch(`/runs/${run}/trace`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!r.ok) { document.getElementById("meta").innerHTML = `<span class="err">${r.status} ${await r.text()}</span>`; return; }
+  const t = await r.json();
+  const rows = flatten(t.roots);
+  const b = bounds(rows);
+  document.getElementById("meta").textContent =
+    `trace ${t.trace_id} · ${rows.length} 个 span · 总时长 ${((b.end - b.start) / 1000).toFixed(2)}s · 点一行看详情`;
+  const box = document.getElementById("rows");
+  for (const s of rows) {
+    const el = document.createElement("div");
+    el.className = "row" + (s.kind === "run" && s.run_id === t.focus_run_id ? " focus" : "");
+    const g = bar(s, b);
+    el.innerHTML = `
+      <div class="name" style="padding-left:${s.depth * 16}px"><span class="kind">${s.kind}</span><span></span>
+        <span class="st ${s.status}">${s.status === "ok" ? "" : s.status}</span></div>
+      <div class="track"><div class="bar ${s.kind} ${s.status}" style="left:${g.left}%;width:${g.width}%"></div></div>
+      <div class="dur">${s.duration_ms == null ? "—" : s.duration_ms + "ms"}</div>
+      <div class="sum"></div>`;
+    el.querySelector(".name span:nth-child(2)").textContent = s.name;  // 名字来自库里（工具名、子任务名），用 textContent 防注入
+    el.querySelector(".sum").textContent = summary(s);
+    el.addEventListener("click", () => {
+      const open = el.querySelector("pre");
+      if (open) return open.remove();
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify({ status: s.status, error: s.error, attrs: s.attrs, ...(s.io ? { input: s.io.input, result: s.io.result } : {}),
+                                        started_at: s.started_at, ended_at: s.ended_at, run_id: s.run_id }, null, 2);
+      el.appendChild(pre);
+    });
+    box.appendChild(el);
+  }
+}
+load();
+</script>
+</body>
+</html>

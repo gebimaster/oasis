@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oasis M7</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#888; --user:#e8f0fe; --bot:#fff; --tool:#f3f3f3; --err:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --fg:#e6e6e6; --muted:#999; --user:#23314d; --bot:#1f2227; --tool:#2a2d33; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  .msg { padding:8px 12px; border-radius:8px; margin:8px 0; white-space:pre-wrap; background:var(--bot); }
+  .user { background:var(--user); }
+  .tool { background:var(--tool); font:13px/1.5 ui-monospace, monospace; color:var(--muted); }
+  .err { color:var(--err); }
+  .note { background:none; color:var(--muted); font-size:13px; padding:2px 12px; }
+  .live { opacity:.75; }
+  form { display:flex; gap:8px; position:sticky; bottom:0; background:var(--bg); padding:8px 0; }
+  input { flex:1; padding:8px; font:inherit; }
+  #status { color:var(--muted); font-size:13px; }
+  .card { border:1px solid #d9a300; background:var(--bot); font-size:14px; }
+  .card .state { color:var(--muted); margin:4px 0; }
+  .card button { margin-right:8px; }
+  .caps { margin:-4px 0 8px; }
+  .cap { display:inline-block; margin:2px 6px 2px 0; padding:2px 10px; border-radius:999px; font-size:13px;
+         border:1px solid var(--muted); background:var(--bot); cursor:pointer; }
+  .cap.completed { border-color:#2e7d32; } .cap.failed, .cap.timeout { border-color:var(--err); }
+  .cap.running { border-color:#1565c0; }
+  .child { font:13px/1.5 ui-monospace, monospace; max-height:260px; overflow:auto; }
+</style>
+</head>
+<body>
+<main>
+  <div id="status">加载中…</div>
+  <div id="log"></div>
+  <div id="live" class="msg live" hidden></div>
+  <form id="f"><input id="q" placeholder="问点什么，例如：北京和上海天气？" autocomplete="off">
+    <button id="send">发送</button><button id="stop" type="button" hidden>停止</button></form>
+</main>
+<script type="module">
+// 最小前端：先订阅、再拉历史、按 message_id 去重。刷新页面可验证「断开后 run 继续 + 历史还在」。
+// M2：事件按 seq 去重（stream.js），断线后带 Last-Event-ID 退避重连。
+import { apply, initial, nextDelay, restore, snapshot } from "/static/stream.js";
+import { afterDecision, applyApprovalEvent, view } from "/static/approval.js";
+import { LABEL, applySubEvent, capsulesOf, fromRows } from "/static/subagents.js";
+// M4：?token=guest-token 切换用户（权限不同）；会话 id 按 token 分开存，避免拿别人的会话吃 404
+const TOKEN = new URLSearchParams(location.search).get("token") || "demo-token";
+const H = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+const $ = (id) => document.getElementById(id);
+const messages = new Map();           // message_id -> message，天然去重
+let cid = null, runId = null;
+let approvals = new Map();            // M5：tool_use_id -> 审批记录，卡片状态的唯一来源（刷新时从库里拉）
+let subs = new Map();                 // M7：子任务胶囊，tool_use_id#index -> {title, status, runId}
+let openChild = null;                 // M7：当前展开的子 run（只展开一个）
+
+function store(k, v) { try { localStorage.setItem(`${TOKEN}:${k}`, v); } catch {} }
+function load(k) { try { return localStorage.getItem(`${TOKEN}:${k}`); } catch { return null; } }
+// O2：续播游标按标签页存（sessionStorage）；隐私模式等存不了时只是退回从 0 回放
+const CURSOR = `${TOKEN}:cursor`;
+function saveCursor(v) { try { v ? sessionStorage.setItem(CURSOR, v) : sessionStorage.removeItem(CURSOR); } catch {} }
+function loadCursor() { try { return sessionStorage.getItem(CURSOR); } catch { return null; } }
+
+const LOOP_NOTE = /^<loop_note kind="(\w+)">[\s\S]*<\/loop_note>$/;  // 和 context.note_kind 同一个格式
+
+function render() {
+  const log = $("log"); log.innerHTML = "";
+  for (const m of [...messages.values()].sort((a, b) => a.id - b.id)) {
+    for (const b of m.content) {
+      const div = document.createElement("div");
+      if (b.type === "text" && m.role === "user" && LOOP_NOTE.test(b.text)) {  // O7：循环插的续写 / 空回复提示，不是用户说的话
+        div.className = "msg note";
+        div.textContent = b.text.match(LOOP_NOTE)[1] === "continue" ? "↳ 回复被长度上限截断，已让模型接着写" : "↳ 回复是空的，已提醒模型作答";
+      }
+      else if (b.type === "text") {
+        div.className = "msg " + m.role;
+        div.textContent = b.text + (m.status === "interrupted" ? "\n（服务中断，此回答未完成）" : "")
+          + (m.status === "stopped" ? "\n（已停止）" : "");
+      }
+      else if (b.type === "tool_use") {  // M4：经 call_tool 代理的调用，显示真正的目标工具
+        div.className = "msg tool";
+        div.textContent = b.name === "call_tool" && b.input?.tool_name
+          ? `🔧 ${b.input.tool_name}(${JSON.stringify(b.input.arguments)})  ·经 call_tool`
+          : `🔧 ${b.name}(${JSON.stringify(b.input)})`;
+      }
+      else if (b.type === "tool_result") { div.className = "msg tool" + (b.is_error ? " err" : ""); div.textContent = "→ " + b.content; }
+      else continue;                     // thinking 块默认是空文本，不展示
+      log.appendChild(div);
+      if (b.type === "tool_use" && approvals.get(b.id)?.decision === "ask") card(approvals.get(b.id));  // 要确认的调用下面画卡片
+      if (b.type === "tool_use" && b.name === "spawn_subagents") capsules(b.id);
+    }
+  }
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+// M7 子任务胶囊：状态来自父流的 subagent_update 或 GET /subagents；点开订阅那个子 run 的事件流
+function capsules(toolUseId) {
+  const list = capsulesOf(subs, toolUseId);
+  if (!list.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "caps";
+  for (const c of list) {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "cap " + c.status;
+    btn.textContent = `${c.title} · ${LABEL[c.status] || c.status}`;
+    btn.disabled = !c.runId;               // 还在排队：没有子 run，没什么可看
+    btn.onclick = () => showChild(c.runId, c.title);
+    wrap.appendChild(btn);
+  }
+  $("log").appendChild(wrap);
+  if (openChild && list.some((c) => c.runId === openChild.runId)) $("log").appendChild(openChild.el);
+}
+
+// 子 run 的过程：从 seq 0 回放（M2 的事件都落了库），工具调用和文字原样拼出来
+async function showChild(id, title) {
+  if (openChild?.runId === id) { openChild = null; render(); return; }  // 再点一次收起
+  const el = document.createElement("div");
+  el.className = "msg tool child";
+  openChild = { runId: id, el };
+  render();
+  let text = `【子任务：${title}】
+`, cur = "";  // O7：cur 是还没定稿的这段字，retract 时只丢它
+  const r = await fetch(`/runs/${id}/stream`, { headers: { ...H, "Last-Event-ID": "0" } });
+  await readSSE(r, async (ev) => {
+    if (ev.type === "text_delta") cur += ev.text;
+    else if (ev.type === "retract") cur = "";
+    else { text += cur; cur = ""; }
+    if (ev.type === "tool_start") text += `
+🔧 ${ev.name}(${JSON.stringify(ev.input)})
+`;
+    else if (ev.type === "tool_end") text += `→ ${String(ev.content).slice(0, 200)}
+`;
+    else if (ev.type === "run_end") text += `
+[结束：${ev.status}/${ev.stop_reason}]`;
+    el.textContent = text + cur;
+  });
+}
+
+async function loadSubagents() {
+  const r = await fetch(`/conversations/${cid}/subagents`, { headers: H });
+  // 合并而不是覆盖：还在排队的子任务库里没有行，只在父流的事件里
+  subs = new Map([...subs, ...fromRows((await r.json()).subagents)]);
+  render();
+}
+
+// M5 确认卡片：显示参数（库里存的那份）、状态和按钮；按钮只发「决定」，不发参数
+function card(a) {
+  const div = document.createElement("div");
+  div.className = "msg card";
+  const v = view(a);
+  div.innerHTML = `<div>🔐 需要你确认：<b></b></div><div class="state"></div>`;
+  div.querySelector("b").textContent = `${a.tool_name}(${JSON.stringify(a.args)})`;
+  div.querySelector(".state").textContent = v.label;
+  for (const [action, text] of v.buttons) {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.textContent = text; btn.dataset.action = action;
+    btn.onclick = () => decide(a, action, div);
+    div.appendChild(btn);
+  }
+  $("log").appendChild(div);
+}
+
+async function decide(a, action, div) {
+  div.querySelectorAll("button").forEach((b) => (b.disabled = true));  // 只是体验；真正防重复靠后端条件 UPDATE
+  const r = await fetch(`/conversations/${cid}/approvals/${a.tool_use_id}`,
+                        { method: "POST", headers: H, body: JSON.stringify({ action }) });
+  const body = await r.json().catch(() => ({}));
+  approvals.set(a.tool_use_id, afterDecision(a, r.status, body));
+  if (r.status !== 200 && r.status !== 409) $("status").textContent = `操作失败：HTTP ${r.status}`;
+  else if (r.status === 409 && body?.detail?.error) $("status").textContent = body.detail.error;  // O10 复核⑤：如「暂时查不出结论」
+  render();
+  if (r.status === 200 && body.run_id) { await follow(body.run_id); await loadApprovals(); }  // 续跑：订阅它的事件
+}
+
+async function loadApprovals() {
+  const r = await fetch(`/conversations/${cid}/approvals`, { headers: H });
+  approvals = new Map((await r.json()).approvals.map((a) => [a.tool_use_id, a]));
+  render();
+}
+
+async function loadHistory() {
+  const r = await fetch(`/conversations/${cid}/messages`, { headers: H });
+  for (const m of (await r.json()).messages) messages.set(m.id, m);
+  render();
+}
+
+function setRunning(id) {
+  runId = id; $("send").disabled = !!id; $("stop").hidden = !id;
+  $("status").textContent = id ? `运行中 run=${id.slice(0, 8)}` : `会话 ${cid.slice(0, 8)}（空闲）`;
+}
+
+// 浏览器的 EventSource 不能带 Authorization 头，所以用 fetch 读流，自己按空行切事件
+async function readSSE(r, onEv) {
+  const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buf += value;
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+      const line = raw.split("\n").find((l) => l.startsWith("data: "));
+      if (line) await onEv(JSON.parse(line.slice(6)));
+    }
+  }
+}
+
+// 跟随一个 run 直到 run_end：流结束却没收到 run_end（网断了、服务重启）就带 Last-Event-ID 退避重连
+async function follow(id) {
+  setRunning(id);
+  let st = restore(loadCursor(), id), delay = 500;   // O2：刷新后接着上次的游标，不从 0 回放
+  if (st.live) { $("live").hidden = false; $("live").textContent = st.live; }
+  while (!st.ended) {
+    try {
+      const r = await fetch(`/runs/${id}/stream`, { headers: { ...H, "Last-Event-ID": String(st.lastSeq) } });
+      if (r.status >= 400 && r.status < 500) { setRunning(null); return; }  // 无权限/不存在：重试也没用
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setRunning(id);
+      await readSSE(r, async (ev) => {
+        const next = apply(st, ev);
+        if (next === st) return;          // 重复事件：丢掉
+        st = next; delay = 500;           // 收到新事件说明连接正常，退避归零
+        saveCursor(st.ended ? null : snapshot(id, st));  // 结束就清掉：下一个 run 从 0 开始
+        await onEvent(ev, st);
+      });
+    } catch { /* 连接失败或中途断开：下面重连 */ }
+    if (!st.ended) {
+      $("status").textContent = `连接断开，${delay / 1000}s 后从 seq ${st.lastSeq} 续播…`;
+      await new Promise((ok) => setTimeout(ok, delay));
+      delay = nextDelay(delay);
+    }
+  }
+}
+
+async function onEvent(ev, st) {
+  const live = $("live");
+  if (ev.type === "text_delta") { live.hidden = false; live.textContent = st.live; }
+  else if (ev.type === "retract") { live.textContent = st.live; live.hidden = !st.live; }  // O7
+  else if (ev.type === "approval_request" || ev.type === "approval_update") {
+    approvals = applyApprovalEvent(approvals, ev); render();
+  }
+  else if (ev.type === "subagent_update") {    // M7：胶囊状态实时变
+    subs = applySubEvent(subs, ev); render();
+  }
+  else if (ev.type === "message_saved") {
+    if (!messages.has(ev.message_id)) await loadHistory();  // 已有就跳过：去重
+    live.hidden = true; live.textContent = "";
+  } else if (ev.type === "run_end") {
+    setRunning(null);
+    await loadSubagents();                       // 父结束（含被停止）：子任务终态以库为准
+    if (ev.stop_reason === "awaiting_approval") $("status").textContent += " · 等待你确认";
+    if (ev.status !== "completed") $("status").textContent += ` · 上次结束：${ev.status}/${ev.stop_reason}`;
+  }
+}
+
+$("f").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = $("q").value.trim(); if (!text) return;
+  const r = await fetch(`/conversations/${cid}/messages`, { method: "POST", headers: H, body: JSON.stringify({ text }) });
+  if (r.status === 409) { $("status").textContent = "上一条还在回答中"; return; }
+  $("q").value = "";
+  const { run_id } = await r.json();
+  const sub = follow(run_id);           // 先订阅，再拉历史
+  await loadHistory();
+  await sub;
+  await loadApprovals();                // 发新消息会把待确认的卡片作废：以库里为准刷新一次
+};
+$("stop").onclick = () => fetch(`/runs/${runId}/cancel`, { method: "POST", headers: H });
+
+(async function init() {
+  cid = load("cid");
+  if (cid && (await fetch(`/conversations/${cid}/messages`, { headers: H })).status !== 200) cid = null;
+  if (!cid) { cid = (await (await fetch("/conversations", { method: "POST", headers: H })).json()).conversation_id; store("cid", cid); }
+  const { run_id } = await (await fetch(`/conversations/${cid}/active_run`, { headers: H })).json();
+  const sub = run_id ? follow(run_id) : null;      // 刷新时有正在跑的 run：先订阅（从 seq 0 回放）
+  if (!run_id) setRunning(null);
+  await loadApprovals();                          // M5：卡片状态从库里来，不靠续播（挂起时 run 已结束）
+  await loadSubagents();                          // M7：胶囊状态同理，刷新后以库为准
+  await loadHistory();                            // 再拉历史
+  if (sub) { await sub; await loadApprovals(); }
+})();
+</script>
+</body>
+</html>

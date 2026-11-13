@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oasis 评测结果</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#888; --line:#e3e3e3; --ok:#2e7d32; --bad:#c62828; --na:#9e9e9e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --fg:#e6e6e6; --muted:#999; --line:#2c2f36; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  .meta { color:var(--muted); font-size:13px; }
+  .wrap { overflow-x:auto; }
+  table { border-collapse:collapse; margin-top:12px; min-width:560px; }
+  th, td { border-bottom:1px solid var(--line); padding:4px 10px; text-align:left; vertical-align:top; }
+  th { font-weight:600; font-size:13px; }
+  .cat { color:var(--muted); font-size:12px; }
+  .chip { display:inline-block; min-width:22px; margin:1px 3px 1px 0; padding:0 6px; border-radius:4px; color:#fff;
+          font:12px/20px ui-monospace, monospace; text-align:center; cursor:pointer; border:0; }
+  .chip.ok { background:var(--ok); } .chip.bad { background:var(--bad); } .chip.na { background:var(--na); }
+  .mech { font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h2>端到端评测</h2>
+  <label>结果文件 <select id="pick"></select></label>
+  <p class="meta" id="meta"></p>
+  <div class="wrap"><table id="tbl"></table></div>
+  <p class="meta">每个方块是一次 trial：✓ 通过 / ✗ 失败 / ? 评委或环境出错（不进分母）。悬停看失败的断言，点击打开这次 trial 的 trace。</p>
+</main>
+<script type="module">
+const pick = document.getElementById("pick");
+
+function openTrace(rec, i) {
+  const run = rec.run_ids[i];
+  try { sessionStorage.setItem(`eval-token:${run}`, rec.token); } catch {}  // 一次性评测 token 不放 URL
+  location.href = `/trace?run=${run}`;  // 同一个标签页跳转（应用内浏览器拦了 window.open 新标签页）；返回键回结果页
+}
+
+function tip(rec) {
+  if (rec.env_error) return `环境故障：${rec.env_error}`;
+  const bad = (rec.grades || []).filter((g) => g.passed !== true)
+    .map((g) => `${g.check}${g.mechanism ? "（机制）" : ""}：${g.detail || g.error || (g.unsupported || []).join("；")}`);
+  return [`延迟 ${rec.latency_s}s · 工具 ${rec.tool_calls} 次 · $${rec.cost_usd}`, ...bad, `回答：${rec.answer || ""}`].join("\n");
+}
+
+async function show(name) {
+  const d = await (await fetch(`/eval/results/${name}`)).json();
+  const s = d.snapshot, cfgs = Object.keys(s.configs);
+  document.getElementById("meta").textContent =
+    `被测 ${s.model} · 评委 ${s.judge_model} · 每题 ${s.trials} 次 · 数据集 ${s.dataset_sha} · ${s.latency_note}`;
+  const cases = [...new Map(d.records.map((r) => [r.case, r.category])).entries()];
+  const tbl = document.getElementById("tbl");
+  tbl.innerHTML = `<tr><th>题</th>${cfgs.map((c) => `<th>${c} ${s.configs[c].name}</th>`).join("")}</tr>`;
+  for (const [cid, cat] of cases) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${cid}<div class="cat">${cat}</div></td>`;
+    for (const c of cfgs) {
+      const td = document.createElement("td");
+      const recs = d.records.filter((r) => r.case === cid && r.config === c).sort((a, b) => a.trial - b.trial);
+      if (!recs.length) td.innerHTML = `<span class="mech">不适用</span>`;
+      for (const r of recs) {
+        const b = document.createElement("button");
+        b.className = "chip " + (r.passed === true ? "ok" : r.passed === false ? "bad" : "na");
+        b.textContent = r.passed === true ? "✓" : r.passed === false ? "✗" : "?";
+        b.title = tip(r);
+        if (r.run_ids?.length) b.addEventListener("click", () => openTrace(r, 0));
+        td.appendChild(b);
+      }
+      const mech = recs.filter((r) => r.mechanism != null);
+      if (mech.length) td.insertAdjacentHTML("beforeend", `<div class="mech">机制 ${mech.filter((r) => r.mechanism).length}/${mech.length}</div>`);
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+}
+
+const { results } = await (await fetch("/eval/results")).json();
+pick.innerHTML = results.map((n) => `<option>${n}</option>`).join("");
+pick.addEventListener("change", () => show(pick.value));
+if (results.length) show(results[0]);
+</script>
+</body>
+</html>
