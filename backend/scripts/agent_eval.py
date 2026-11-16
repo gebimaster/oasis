@@ -182,6 +182,7 @@ async def main(args) -> None:
     shutil.rmtree(KB_DIR, ignore_errors=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out = BACKEND / "eval" / "results" / f"agent-eval-{stamp}"
+    out.parent.mkdir(parents=True, exist_ok=True)  # 公开仓库不带 eval/results，先建好，免得付费跑完写结果时报错
     records = []
     with open(BACKEND / "scripts" / "agent_eval_server.log", "w", encoding="utf-8") as log:
         for cfg in args.configs.split(","):

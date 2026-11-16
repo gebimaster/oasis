@@ -195,6 +195,7 @@ async def main(args) -> None:
                 "dataset_sha": ae.sha(CASES), "configs": CONFIGS, "parallel": ae.PARALLEL,
                 "cost_usd": sum(x.get("cost_usd", 0) for x in recs), "extract_estimate": EXTRACT_EST}
     out = ae.BACKEND / "eval" / "results" / f"memory-eval-{stamp}"
+    out.parent.mkdir(parents=True, exist_ok=True)  # 公开仓库不带 eval/results，先建好，免得付费跑完写结果时报错
     out.with_suffix(".json").write_text(json.dumps({"snapshot": snapshot, "analysis": a, "records": recs},
                                                    ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     out.with_suffix(".md").write_text(report(snapshot, a, recs), encoding="utf-8")

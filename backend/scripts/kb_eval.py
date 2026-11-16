@@ -187,6 +187,7 @@ async def main() -> None:
     ap.add_argument("--rewrite", action="store_true")
     ap.add_argument("--replay", metavar="AGENT_EVAL_NAME")
     args = ap.parse_args()
+    (BACKEND / "eval" / "results").mkdir(parents=True, exist_ok=True)  # 公开仓库不带 eval/results，先建好，免得付费跑完写结果时报错
     kb, stats = await build_kb()
     queries = json.loads(QUERIES.read_text(encoding="utf-8"))
     extra = {"grid": grid, "rewrite": rewrite_compare}

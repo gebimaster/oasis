@@ -238,6 +238,7 @@ async def main(args) -> None:
             "cost_usd": sum(r.get("cost_usd", 0) for r in recs) + seed_cost + l1_cost
             + n_distill * cost_usd(DISTILL_EST, ae.MODEL), "scans": scans}
     out = ae.BACKEND / "eval" / "results" / f"lesson-eval-{stamp}"
+    out.parent.mkdir(parents=True, exist_ok=True)  # 公开仓库不带 eval/results，先建好，免得付费跑完写结果时报错
     out.with_suffix(".json").write_text(json.dumps({"snapshot": snap, "candidates": cands, "gate": gate, "compare": cmp,
                                                     "harmful": harm, "records": recs}, ensure_ascii=False, indent=1,
                                                    default=str), encoding="utf-8")
