@@ -102,7 +102,8 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                    now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
                    summary: str | None = None, compactor: Callable | None = None,
                    limits: dict | None = None, persona: str = context.PERSONA,
-                   context_limit: int | None = None, cleared_until: int = 0) -> AsyncIterator[dict]:
+                   context_limit: int | None = None, cleared_until: int = 0,
+                   memory_block: str = "", memory_notes: list[str] = ()) -> AsyncIterator[dict]:
     """messages 是水位之后的原文（可带 status/usage/id）；summary 是已有摘要。
     compactor 由 runner 注入（循环不碰数据库）；model_stream、now、limits 可注入做测试；persona 子智能体换成合同。
     context_limit（M7 子智能体预算）：某一轮的上下文超过它，下一轮就当最后一轮（不许调工具、必须交汇报）。
@@ -137,7 +138,9 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
             return context.build_request(user_name=user_name, summary=s, history=h,
                                          now=now(), final_turn=last, catalog=tools.deferred_catalog(),
                                          loaded_defs=tools.definitions(tools.context().loaded), persona=persona,
-                                         notes=notes, instruction=instruction)
+                                         notes=[compaction.status_note(s), *memory_notes, *notes],  # P3-C5
+                                         instruction=instruction,
+                                         memory_block=memory_block)  # P2：记忆的提醒进尾部，不动层 2
 
         def build(s, h):
             return shape(s, microcompact.project(h, cleared_until))  # O9：确定的投影

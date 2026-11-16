@@ -24,7 +24,9 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 os.environ.update(_pinned)
 
 from app import approvals, context, db, kb_api, mcp_client, runner, subagent_tool, tools, trace_api  # noqa: E402  需在加载 .env 之后导入
-from app import sandbox, sandbox_tools, web_tools  # noqa: E402  M9
+from app import memory_extract, sandbox, sandbox_tools, web_tools  # noqa: E402  M9
+from app import forget, memory_store  # noqa: E402  P3
+from app import lesson_demo, lesson_tools  # noqa: E402  P4
 from app.hub import END, RESET, hub  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +72,8 @@ async def lifespan(_: FastAPI):
         log.warning("recovered %d runs with expired leases", n)
     if n := await db.recover_kb_documents():  # M6：上次没入完的文档标 failed
         log.warning("marked %d interrupted kb documents as failed", n)
+    if n := await memory_extract.recover():  # P2：上次没抽完的记忆任务补跑
+        log.warning("resumed %d memory extraction jobs", n)
     for name, token, perms in DEMO_USERS:
         uid = await db.user_id_by_token(token) or await db.create_user(name, token)
         await db.grant_permissions(uid, perms)  # 幂等：已有的跳过
@@ -81,6 +85,12 @@ async def lifespan(_: FastAPI):
         runner.start(conversation_id, run_id)
     if os.getenv("SUBAGENTS") == "0":  # M8 对比配置 C：关掉子智能体（模型看不到 spawn_subagents）
         tools.unregister(subagent_tool.NAME)
+    if not memory_extract.enabled():  # P2：评测的无记忆基线，三个记忆工具一起拿掉
+        # P4：memory_open 也是经验的下钻入口，经验开着就留下它（评测里有无经验两组的 tools 要完全一样）
+        for name in ("memory_search", "memory_write", *(() if lesson_tools.enabled() else ("memory_open",))):
+            tools.unregister(name)
+    if os.getenv("LESSON_DEMO") == "1":  # P4：两个带隐含规矩的演示工具，只在经验评测时打开
+        lesson_demo.register()
     if os.getenv("WEB_TOOLS") == "0":  # M9：关掉联网工具（比如评测时不想花搜索费）
         for name in web_tools.NAMES:
             tools.unregister(name)
@@ -314,9 +324,60 @@ async def delete_kb_document(doc_id: UUID, user_id: UUID = Depends(current_user)
 app.include_router(trace_api.make_router(owned_run))  # M8：/runs/{id}/trace、/eval/results、/trace、/eval 页面
 
 
+# ---------------- P3：删除对话 + 记忆管理页（D8=A）。所有查询都按鉴权拿到的 user_id 过滤 ----------------
+
+class MemoryEdit(BaseModel):
+    content: str = Field(min_length=1, max_length=300)
+    kind: str | None = None
+    valid_until: str | None = None  # YYYY-MM-DD；'' = 没有期限；不传 = 沿用
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: UUID, user_id: UUID = Depends(current_user)):
+    try:
+        res = await forget.delete_conversation(user_id, conversation_id)
+    except forget.Busy:
+        raise HTTPException(409, "还有回答在进行中，先停止再删除")
+    if res is None:
+        raise HTTPException(404, "conversation not found")
+    return res  # 级联结果：作废了哪些记忆、恢复了哪些，前端提示用
+
+
+@app.get("/memories")
+async def list_memories(status: str | None = None, user_id: UUID = Depends(current_user)):
+    return {"memories": await memory_store.list_items(user_id, status=status)}
+
+
+@app.get("/memories/{memory_id}/events")
+async def memory_events(memory_id: int, user_id: UUID = Depends(current_user)):
+    return {"events": await memory_store.events(user_id, memory_id)}
+
+
+@app.put("/memories/{memory_id}")
+async def edit_memory(memory_id: int, body: MemoryEdit, user_id: UUID = Depends(current_user)):
+    if body.kind is not None and body.kind not in memory_store.KINDS:
+        raise HTTPException(422, "非法的 kind")
+    res = await memory_store.edit(user_id, memory_id, body.content.strip(), body.kind, body.valid_until)
+    if res is None:
+        raise HTTPException(404, "memory not found or not active")  # 别人的、已作废的都一样
+    await memory_store.index(res["id"], body.content.strip())  # 向量失败也不影响，关键词那一路照样搜得到
+    return res
+
+
+@app.delete("/memories/{memory_id}", status_code=204)
+async def delete_memory(memory_id: int, user_id: UUID = Depends(current_user)):
+    if not await memory_store.forget(user_id, memory_id):
+        raise HTTPException(404, "memory not found or not active")
+
+
 @app.get("/")
 async def index():
     return FileResponse(Path(__file__).parent.parent / "static" / "index.html")
+
+
+@app.get("/memory")
+async def memory_page():
+    return FileResponse(Path(__file__).parent.parent / "static" / "memory.html")
 
 
 @app.get("/static/{name}.js")

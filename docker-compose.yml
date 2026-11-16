@@ -1,7 +1,9 @@
 # 本地开发用 PostgreSQL：docker compose up -d
+# P2（2026-11-13）：换成带 pgvector 的镜像（debian/glibc）。旧的 alpine 卷 pgdata 留着做回滚，
+# 数据按 pg_dump → 新卷 → pg_restore 迁过来（musl 和 glibc 的 en_US.utf8 排序不一致，不能直接复用旧卷）
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: oasis
       POSTGRES_PASSWORD: oasis   # 仅本地开发
@@ -9,7 +11,8 @@ services:
     ports:
       - "5433:5432"   # 用 5433，避免和本机其他 PG 冲突
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgvector_data:/var/lib/postgresql/data
 
 volumes:
-  pgdata:
+  pgdata:          # 旧 alpine 卷，回滚用
+  pgvector_data:

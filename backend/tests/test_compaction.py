@@ -90,9 +90,10 @@ def test_compaction_end_to_end(monkeypatch):
         # 第二个 run：从水位加载，前面换成摘要
         run2 = await db.start_run(cid, [{"type": "text", "text": "第5个问题"}])
         await runner._run(cid, run2, model_stream=stream, limits={"trigger": 10**9, "target": 10**9})
-        # C2：摘要末尾是代码生成的 ref 段，落库后下个 run 原样带上
-        assert calls[1]["messages"][1]["content"].startswith(
-            "<summary>\n摘要：用户问过北京天气\n\n## 关键标识与 ref\n- get_weather {\"city\": \"城市1\"}\n")
+        # C2：摘要末尾是代码生成的 ref 段；P3-C3：前面是代码生成的用户原话段。落库后下个 run 原样带上
+        sent2 = calls[1]["messages"][1]["content"]
+        assert sent2.startswith("<summary>\n摘要：用户问过北京天气\n\n" + compaction.WORDS_HEADING + "\n<said>\n第1个问题\n</said>")
+        assert "\n\n## 关键标识与 ref\n- get_weather {\"city\": \"城市1\"}\n" in sent2
         assert calls[1]["messages"][2]["content"][0]["text"] == kept_first["content"][0]["text"]
     with_fresh_db(body)
 

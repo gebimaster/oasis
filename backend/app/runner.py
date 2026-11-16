@@ -9,6 +9,8 @@ import os
 from uuid import UUID
 
 from app import (approvals, compaction, context, db, kb_tool, recall, subagent, subagent_tool,  # noqa: F401  import 即注册工具
+                 memory_extract, memory_search, memory_tools,  # P2
+                 lesson_tools,  # P4
                  tool_search, tools, trace, transfer, web_tools)
 from app.agent_loop import run_loop
 from app.hub import hub
@@ -217,8 +219,12 @@ async def _run(conversation_id: UUID, run_id: UUID, **loop_kwargs) -> None:
         last_assistant = None  # 挂起时要知道这批 tool_use 在哪条消息里
         compactor = compaction.make_compactor(conversation_id, cp["revision"])
         stream = trace.traced_llm(loop_kwargs.pop("model_stream", None), run_id)  # M8：每轮一个 llm span
+        block = await memory_tools.frozen_block(conversation_id, user["id"])  # P2：层 2 的记忆摘要块，每个对话只拼一次
+        # 摘要块冻结了：过时的条目在尾部点名，本对话里新记下的在尾部回显
+        mem_notes = await memory_tools.tail_notes(user["id"], block, conversation_id)
+        mem_notes += await lesson_tools.for_run(user["id"], run_id, history)  # P4：按本 run 的提问挑经验，进尾部
         async for ev in run_loop(history, user_name=user["name"], summary=cp["summary"],
-                                 compactor=compactor, model_stream=stream,
+                                 compactor=compactor, model_stream=stream, memory_block=block, memory_notes=mem_notes,
                                  cleared_until=cl["cleared_until_id"], **loop_kwargs):
             if ev["type"] == "text_delta":
                 await w.text(ev["text"])
@@ -242,8 +248,11 @@ async def _run(conversation_id: UUID, run_id: UUID, **loop_kwargs) -> None:
                                write=lambda: db.suspend_run(conversation_id, run_id, last_assistant, rows))
             elif ev["type"] == "run_end":
                 await w.finish(ev["status"], ev["stop_reason"], ev.get("error"))
+                await lesson_tools.after_run(run_id)  # P4：注入的经验管的工具失败了，记一次违反
             else:  # tool_start / tool_end / compacted / loop_guard（O6）/ continued、retract（O7）
                 await w.emit(lambda: db.append_event(run_id, ev))
+            if ev["type"] == "run_end" and ev["status"] == "completed":  # P2：正常结束（含挂起等审批）才抽记忆，后台跑
+                memory_extract.kick(run_id, user["id"])
     except asyncio.CancelledError:
         try:
             # 有未收口的审批批次时不加标记：tool_use 后面必须先跟它的 tool_result，批次由下一条消息收口

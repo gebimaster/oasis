@@ -20,3 +20,15 @@ def tool_context():
 def no_kb_rewrite(monkeypatch):
     """O8 复核⑭：.env 里开了 KB_REWRITE=1 的话，知识库测试里弱的假检索会去调真模型。测试一律关掉，要测的自己再开。"""
     monkeypatch.delenv("KB_REWRITE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_memory_extract(monkeypatch):
+    """P2：run 正常结束会在后台调真模型抽记忆。测试一律关掉，测记忆的用例自己再开。"""
+    monkeypatch.setenv("MEMORY", "0")
+
+
+@pytest.fixture(autouse=True)
+def no_lessons(monkeypatch):
+    """P4：经验的读取每个 run 都会查库、可能算一次向量。测试一律关掉，测经验的用例自己再开。"""
+    monkeypatch.setenv("LESSONS", "0")

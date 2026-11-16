@@ -27,10 +27,13 @@
   .cap.completed { border-color:#2e7d32; } .cap.failed, .cap.timeout { border-color:var(--err); }
   .cap.running { border-color:#1565c0; }
   .child { font:13px/1.5 ui-monospace, monospace; max-height:260px; overflow:auto; }
+  #bar { display:flex; gap:12px; align-items:center; justify-content:flex-end; font-size:13px; }
+  #bar a { color:inherit; }
 </style>
 </head>
 <body>
 <main>
+  <nav id="bar"><a id="memlink" href="/memory">我的记忆</a><button id="del" type="button">删除当前对话</button></nav>
   <div id="status">加载中…</div>
   <div id="log"></div>
   <div id="live" class="msg live" hidden></div>
@@ -266,6 +269,17 @@ $("f").onsubmit = async (e) => {
   await loadApprovals();                // 发新消息会把待确认的卡片作废：以库里为准刷新一次
 };
 $("stop").onclick = () => fetch(`/runs/${runId}/cancel`, { method: "POST", headers: H });
+// P3：删除整个对话（硬删除）。引用它作证据的记忆按引用计数作废，被它取代过的旧记忆恢复；结果告诉用户
+$("memlink").href = `/memory?token=${encodeURIComponent(TOKEN)}`;
+$("del").onclick = async () => {
+  if (!confirm("删除当前对话？消息原文会被彻底删除，只来自这个对话的记忆也会一起删掉。")) return;
+  const r = await fetch(`/conversations/${cid}`, { method: "DELETE", headers: H });
+  if (r.status === 409) { alert("还有回答在进行中，先点停止再删除。"); return; }
+  if (!r.ok) { alert(`删除失败：${r.status}`); return; }
+  const res = await r.json();
+  alert(`已删除 ${res.messages} 条消息；作废记忆 ${res.revoked.length} 条，恢复旧记忆 ${res.restored.length} 条。`);
+  store("cid", ""); location.reload();  // 下次进来新开一个对话
+};
 
 (async function init() {
   cid = load("cid");

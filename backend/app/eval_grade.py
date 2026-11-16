@@ -62,6 +62,18 @@ def tool_attempted(t: Trial, name: str) -> tuple[bool, str]:
     return n > 0, f"{name} 调用 {n} 次（含失败）"
 
 
+def tool_errors_max(t: Trial, name: str, max: int = 0) -> tuple[bool, str]:  # noqa: A002
+    """P4：某个工具最多失败几次。「最后救回来了」不等于「一次就做对」：经验要省掉的正是那几次失败的调用。"""
+    n = sum(1 for c in t.calls if c["name"] == name and c["is_error"])
+    return n <= max, f"{name} 失败 {n} 次"
+
+
+def tool_calls_max(t: Trial, name: str, max: int = 1) -> tuple[bool, str]:  # noqa: A002
+    """P4：某个工具最多成功调用几次。写操作（如报销）调两次就是重复提交。"""
+    n = sum(1 for c in t.calls if c["name"] == name and not c["is_error"])
+    return n <= max, f"{name} 成功 {n} 次"
+
+
 def result_has(t: Trial, name: str, text: str) -> tuple[bool, str]:
     """工具结果里有某句话：如 kb_search 返回了干净的 not_found。"""
     ok = any(c["name"] == name and text in str(c["result"]) for c in t.calls)
@@ -113,7 +125,8 @@ def continued(t: Trial, min_count: int = 1) -> tuple[bool, str]:
 
 CHECKS: dict[str, Callable[..., tuple[bool, str]]] = {
     f.__name__: f for f in (tool_called, tool_attempted, tool_not_succeeded, result_has, answer_has, answer_lacks,
-                            stop_reason, ledger, approval, children, compacted, continued)}
+                            stop_reason, ledger, approval, children, compacted, continued,
+                            tool_errors_max, tool_calls_max)}
 
 # ---------- LLM 评委：忠实度 ----------
 

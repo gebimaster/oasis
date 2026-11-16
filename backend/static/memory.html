@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的记忆</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#888; --card:#fff; --line:#ddd; --err:#c62828; --ok:#2e7d32; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --fg:#e6e6e6; --muted:#999; --card:#1f2227; --line:#333; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
+  header a { color:inherit; font-size:13px; }
+  .tabs button { margin-right:4px; } .tabs button.on { font-weight:700; }
+  .item { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:10px 0; }
+  .item.gone { opacity:.6; }
+  .meta { color:var(--muted); font-size:13px; display:flex; flex-wrap:wrap; gap:4px 10px; }
+  .tag { border:1px solid var(--line); border-radius:999px; padding:0 8px; }
+  .tag.active { border-color:var(--ok); color:var(--ok); } .tag.revoked { border-color:var(--err); color:var(--err); }
+  .content { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .ops button { margin-right:6px; font-size:13px; }
+  .edit { display:flex; gap:6px; margin:6px 0; } .edit input { flex:1; min-width:0; padding:6px; font:inherit; }
+  .events { font-size:13px; color:var(--muted); margin:6px 0 0; padding-left:18px; }
+  #msg { color:var(--muted); font-size:13px; min-height:1.6em; }
+</style>
+</head>
+<body>
+<main>
+  <header><h2 style="margin:0">我的记忆</h2><a id="back" href="/">← 回到对话</a></header>
+  <p style="color:var(--muted);font-size:13px">助手从你亲口说过的话里记下这些。修改会新写一条取代旧的；删除会作废并抹掉内容。每次变化都有记录。</p>
+  <div class="tabs" id="tabs"></div>
+  <div id="msg"></div>
+  <div id="list"></div>
+</main>
+<script type="module">
+// P3 记忆管理页（D8=A）：查看、修改、删除、看事件历史。用户身份只来自 token（同聊天页的 ?token=）
+const TOKEN = new URLSearchParams(location.search).get("token") || "demo-token";
+const H = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+const $ = (id) => document.getElementById(id);
+const STATUS = { "": "全部", active: "有效", superseded: "已被取代", revoked: "已作废" };
+const KIND = { preference: "偏好", fact: "事实", commitment: "约定", note: "笔记" };
+const SOURCE = { user_stated: "你说的", agent_inferred: "助手推断", tool_derived: "工具结果" };
+const OP = { add: "新增了这条", supersede: "取代了这条", revoke: "作废了这条", restore: "恢复了这条" };
+const ACTOR = { extractor: "后台抽取", agent: "助手", user: "你" };
+const REASON = { user_deleted: "你在这里删除", conversation_deleted: "来源对话被删除" };
+let filter = "active";
+$("back").href = `/?token=${encodeURIComponent(TOKEN)}`;
+
+function el(tag, attrs = {}, ...kids) {  // 只用 textContent 拼，记忆内容来自用户输入，不能当 HTML
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) k === "class" ? (e.className = v) : (e[k] = v);
+  for (const k of kids) e.append(k);
+  return e;
+}
+const day = (s) => s ? new Date(s).toLocaleDateString("sv-SE") : "";  // 按浏览器本地时区，sv-SE 正好是 YYYY-MM-DD
+const time = (s) => new Date(s).toLocaleString("sv-SE").slice(0, 16);
+const say = (t) => { $("msg").textContent = t; };
+
+function tabs() {
+  $("tabs").replaceChildren(...Object.entries(STATUS).map(([k, label]) =>
+    el("button", { type: "button", class: k === filter ? "on" : "", textContent: label, onclick: () => { filter = k; load(); } })));
+}
+
+async function load() {
+  tabs();
+  const r = await fetch(`/memories${filter ? `?status=${filter}` : ""}`, { headers: H });
+  if (!r.ok) { say(`加载失败：${r.status}`); return; }
+  const { memories } = await r.json();
+  $("list").replaceChildren(...memories.map(card));
+  if (!memories.length) $("list").append(el("p", { class: "meta", textContent: "这里还没有记忆。" }));
+}
+
+function card(m) {
+  const expired = m.invalid_at && m.status === "active" && new Date(m.invalid_at) <= new Date();
+  const meta = el("div", { class: "meta" },
+    el("span", { textContent: `#${m.id}` }), el("span", { class: `tag ${m.status}`, textContent: STATUS[m.status] || m.status }),
+    el("span", { textContent: KIND[m.kind] || m.kind }), el("span", { textContent: SOURCE[m.source] || m.source }),
+    el("span", { textContent: `记于 ${day(m.created_at)}` }),
+    el("span", { textContent: `来源消息 ${m.evidence} 条` }));
+  if (m.invalid_at && m.status === "active") meta.append(el("span", { textContent: `${expired ? "已过期，" : ""}到 ${day(m.invalid_at)} 为止` }));
+  if (m.superseded_by) meta.append(el("span", { textContent: `被 #${m.superseded_by} 取代` }));
+  const box = el("div", { class: `item ${m.status === "active" ? "" : "gone"}` }, meta, el("div", { class: "content", textContent: m.content }));
+  const ops = el("div", { class: "ops" });
+  if (m.status === "active") {
+    ops.append(el("button", { type: "button", textContent: "修改", onclick: () => editor(box, m) }),
+               el("button", { type: "button", textContent: "删除", onclick: () => remove(m) }));
+  }
+  ops.append(el("button", { type: "button", textContent: "历史", onclick: () => history(box, m) }));
+  box.append(ops);
+  return box;
+}
+
+function editor(box, m) {
+  if (box.querySelector(".edit")) return;
+  const input = el("input", { value: m.content, maxLength: 300 });
+  // 有效期：清空 = 没有期限。内容里改了日期，期限也要跟着改
+  const until = el("input", { type: "date", value: day(m.invalid_at), title: "有效期到（可清空）", style: "flex:0 0 auto" });
+  const save = async () => {
+    const content = input.value.trim();
+    if (!content || (content === m.content && until.value === day(m.invalid_at))) return;
+    const body = JSON.stringify({ content, valid_until: until.value });
+    const r = await fetch(`/memories/${m.id}`, { method: "PUT", headers: H, body });
+    if (!r.ok) { say(`修改失败：${r.status}`); return; }
+    say(`已改成新的一条 #${(await r.json()).id}，旧的 #${m.id} 标为已被取代。`);
+    load();
+  };
+  input.onkeydown = (e) => { if (e.key === "Enter") save(); };
+  box.insertBefore(el("div", { class: "edit" }, input, until,
+    el("button", { type: "button", textContent: "保存", onclick: save }),
+    el("button", { type: "button", textContent: "取消", onclick: (e) => e.target.parentElement.remove() })), box.querySelector(".ops"));
+  input.focus();
+}
+
+async function remove(m) {
+  if (!confirm(`删除记忆 #${m.id}？内容会被抹掉，助手以后不会再用它。`)) return;
+  const r = await fetch(`/memories/${m.id}`, { method: "DELETE", headers: H });
+  say(r.ok ? `已删除 #${m.id}。` : `删除失败：${r.status}`);
+  load();
+}
+
+async function history(box, m) {
+  const old = box.querySelector(".events");
+  if (old) { old.remove(); return; }
+  const { events } = await (await fetch(`/memories/${m.id}/events`, { headers: H })).json();
+  box.append(el("ul", { class: "events" }, ...events.map((e) => {
+    const verb = e.op === "supersede" && e.detail?.by ? `用 #${e.detail.by} 取代了这条` : OP[e.op] || e.op;
+    const why = e.detail?.reason ? `（${REASON[e.detail.reason] || e.detail.reason}）` : "";
+    return el("li", { textContent: `${time(e.created_at)} ${ACTOR[e.actor] || e.actor}${verb}${why}` });
+  })));
+}
+
+load();
+</script>
+</body>
+</html>

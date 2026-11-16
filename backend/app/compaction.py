@@ -41,7 +41,7 @@ SUMMARY_TEMPLATE = """按下面的格式写，某段没有内容就写「（无�
 ## 未回答的用户请求
 - 还没答复、或还要继续做的用户请求，保留原话；已经答复的不写
 </template>
-规则：每段用简短的单行要点；名字、数字、ID、文件名、URL 原样保留；不要编造；不要写「关键标识与 ref」这一段，系统会自动补上；\
+规则：每段用简短的单行要点；名字、数字、ID、文件名、URL 原样保留；不要编造；不要写「用户原话」和「关键标识与 ref」这两段，系统会自动补上；\
 不要提到压缩或摘要过程。"""
 # 增量合并（opencode 的 update prompt）：旧摘要 + 新历史 → 一份，新的优先，没被推翻的照抄，不整篇重写
 MERGE_RULES = ("开头 <summary> 里是之前的摘要。把它和之后的对话合并成一份新摘要：新信息优先；旧摘要里没有被推翻、解决或过时的内容原样保留；"
@@ -96,11 +96,89 @@ def split_refs(summary: str | None) -> tuple[str, list[str]]:
     return head.strip(), [ln for ln in tail.splitlines() if ln.startswith("- ")]
 
 
+# P3-C3：被压掉的用户原话逐字保留在摘要里，由代码生成（同 ref 段，模型不写）。Codex 保留全部用户消息、上限约 20k
+WORDS_HEADING = "## 用户原话（逐字保留，系统生成）"
+WORDS_RATIO, WORDS_CAP = 0.05, 20000  # 用户选 A：窗口的 5%，封顶 2 万 token
+_SAID = re.compile(r"<said>\n(.*?)\n</said>", re.S)
+_DROPPED = re.compile(r"（中间还有 (\d+) 条原话没放下）")
+
+
+def _esc(text: str) -> str:
+    """用户原话里出现这几个标记会把拆分弄乱：改成长得像、但不匹配的字。"""
+    for k in ("</said>", WORDS_HEADING, REFS_HEADING):
+        text = text.replace(k, "＃" + k[1:] if k.startswith("#") else "＜/said>")
+    return text
+
+
+def split_summary(summary: str | None) -> tuple[str, list[str], int, list[str]]:
+    """拆成（模型写的正文, 原话列表, 更早没放下的条数, ref 段的行）。顺序固定：正文 → 原话段 → ref 段。"""
+    rest, refs = split_refs(summary)
+    body, _, words = rest.partition(WORDS_HEADING)
+    m = _DROPPED.search(_SAID.sub("", words))  # 只在 <said> 之外找，用户原话里写了同样的字也不算
+    return body.strip(), _SAID.findall(words), int(m.group(1)) if m else 0, refs
+
+
+def _said(items: list[str]) -> str:
+    return "\n".join(f"<said>\n{t}\n</said>" for t in items)
+
+
+def user_words(old: list[str], dropped: int, source: list[dict]) -> str:
+    """旧原话 + 摘要源里的真提问（每条先截断）→ 去重留最后一次 → 保头保尾：
+    最早一条（常是任务定义）固定保留，剩下的预算从新往旧放，放不下的整条不要并计数。
+    P3 验收改的：原来只按新的优先，200 轮闲聊把最早说车牌的那句挤掉，段首「可用 recall 搜」又引导模型去查。
+    单条上限取 USER_CHARS 和预算的一半里小的那个：小窗口（4 万 → 预算 2000）里一条长原话也不会独占、更不会自己放不下。"""
+    limit = min(int(budget.context_window() * WORDS_RATIO), WORDS_CAP)
+    cap = min(USER_CHARS, limit // 2)
+    new = [_esc(_clip(t, cap)) for m in source if is_real_user(m) and (t := context.text_of(m["content"]).strip())]
+    said = list(reversed(dict.fromkeys(reversed(old + new))))
+    if not said:
+        return f"\n\n{WORDS_HEADING}\n（中间还有 {dropped} 条原话没放下）" if dropped else ""
+    head, used, tail = said[0], budget.estimate_text(said[0]), []
+    for t in reversed(said[1:]):
+        used += budget.estimate_text(t)
+        if used > limit:
+            break
+        tail.append(t)
+    dropped += len(said) - 1 - len(tail)
+    note = f"\n（中间还有 {dropped} 条原话没放下）" if dropped else ""
+    return f"\n\n{WORDS_HEADING}\n{_said([head])}{note}" + (f"\n{_said(tail[::-1])}" if tail else "")
+
+
+# P3-C5：压缩后每轮拼在层4 尾部的状态块（不落库、不进缓存）。从摘要里原样摘几段，放到离生成位置最近的地方；
+# 再加一句使用提示：P1 验收里摘要都有答案，模型仍每题 recall 一次核对（1.0 对不压缩的 0.417）
+STATUS_SECTIONS = ("## 目标", "### 进行中", "## 下一步", "## 未回答的用户请求")
+STATUS_REFS, STATUS_CHARS = 5, 1200  # 最近几个 ref；摘出来的段落最多多少字
+STATUS_HINT = "摘要（包括「用户原话」段）里已经有的信息直接用；只有缺少其中没有的原文细节（具体数字、名字、步骤）时才用 recall。"
+
+
+def status_note(summary: str | None) -> str:
+    """摘要 → 尾部状态块。同一份摘要永远得到同样的字；没有摘要返回空串。"""
+    if not summary:
+        return ""
+    body, _, _, refs = split_summary(summary)
+    picked, keep = [], False
+    for line in body.splitlines():
+        if line.startswith("#"):  # 遇到标题：是要摘的就开始收，否则停
+            keep = line.strip() in STATUS_SECTIONS
+            if keep:
+                picked.append(line.strip())
+        elif keep and line.strip() and line.strip() not in ("（无）", "- （无）"):
+            picked.append(line)
+    text = "\n".join(ln for i, ln in enumerate(picked)  # 去掉下面没内容的标题
+                     if not ln.startswith("#") or (i + 1 < len(picked) and not picked[i + 1].startswith("#")))
+    if len(text) > STATUS_CHARS:
+        text = text[:STATUS_CHARS] + "……（完整内容见上面的摘要）"
+    recent = "\n最近的 ref：\n" + "\n".join(refs[-STATUS_REFS:]) if refs else ""
+    return f"\n<status>\n压缩后的当前状态（摘自上面的摘要）：\n{text}{recent}\n{STATUS_HINT}\n</status>"
+
+
 def with_refs(model_text: str, old_summary: str | None, source: list[dict]) -> str:
-    """模型写的 ref 段整段丢掉；旧摘要的 ref 段 + 这次摘要源的调用 → 去重（留最后一次）、保序、只留最近 MAX_REFS 条。"""
-    body, _ = split_refs(model_text)
-    lines = split_refs(old_summary)[1] + tool_log(source)
-    merged = list(reversed(dict.fromkeys(reversed(lines))))[-MAX_REFS:]
+    """模型写的原话段、ref 段整段丢掉，由代码重建：原话段见 user_words；
+    ref 段 = 旧摘要的 ref 段 + 这次摘要源的调用 → 去重（留最后一次）、保序、只留最近 MAX_REFS 条。"""
+    body = split_summary(model_text)[0]
+    _, old_words, dropped, old_refs = split_summary(old_summary)
+    body += user_words(old_words, dropped, source)
+    merged = list(reversed(dict.fromkeys(reversed(old_refs + tool_log(source)))))[-MAX_REFS:]
     return f"{body}\n\n{REFS_HEADING}\n" + "\n".join(merged) if merged else body
 # (旧摘要, 摘要源, 压缩指令) → {"system", "messages", "tools"}：由循环提供，和它的正常请求同一套拼法
 Prompt = Callable[[str | None, list[dict], str], dict]
@@ -292,7 +370,7 @@ def fallback_summary(old_summary: str | None, messages: list[dict]) -> str:
         elif m["role"] == "assistant" and (t := context.text_of(m["content"]).strip()):
             answer = t  # 同一回合里后面的覆盖前面的：只留最后一条
     flush()
-    body = split_refs(old_summary)[0]
+    body = split_summary(old_summary)[0]  # 原话段、ref 段由 with_refs 重建，这里只留正文
     return (f"{body}\n\n" if body else "") + FALLBACK_HEADING + "\n" + "\n".join(lines)
 
 

@@ -240,3 +240,110 @@ ALTER TABLE tool_approval DROP CONSTRAINT IF EXISTS tool_approval_status_check;
 ALTER TABLE tool_approval ADD CONSTRAINT tool_approval_status_check CHECK (status IN (
     'pending', 'approved', 'rejected', 'superseded', 'executing', 'succeeded', 'failed', 'outcome_unknown',
     'denied', 'deferred'));
+
+-- P2：用户记忆。只作废、不删除（D4=A）：被取代 → superseded，被撤销 → revoked；检索只看 active，过滤写在 SQL 里。
+-- 两条时间轴：valid_from / invalid_at 是「现实中」何时成立、何时不再成立；created_at / superseded_at 是「系统里」何时写入、何时被取代
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS memory_items (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- 小整数：抽取时让模型按编号引用旧条目，不让它抄长 id
+    user_id       uuid NOT NULL REFERENCES users(id),
+    kind          text NOT NULL CHECK (kind IN ('preference', 'fact', 'commitment', 'note')),
+    content       text NOT NULL,
+    source        text NOT NULL CHECK (source IN ('user_stated', 'agent_inferred', 'tool_derived')),
+    status        text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded', 'revoked', 'quarantined')),
+    valid_from    timestamptz NOT NULL DEFAULT now(),
+    invalid_at    timestamptz,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    superseded_at timestamptz,
+    superseded_by bigint REFERENCES memory_items(id),
+    run_id        uuid REFERENCES runs(id),          -- 哪个 run 写的（抽取或 memory_write）
+    embedding     vector(1024)                       -- bge-m3；算失败就留空，关键词那一路照样搜得到
+);
+CREATE INDEX IF NOT EXISTS memory_items_active ON memory_items (user_id, id) WHERE status = 'active';
+-- 证据：记忆 ↔ 来源消息（用户选 A：关联表）。删消息时按 message_id 反查要作废的记忆（P3）
+CREATE TABLE IF NOT EXISTS memory_evidence (
+    memory_id  bigint NOT NULL REFERENCES memory_items(id),
+    message_id bigint NOT NULL REFERENCES messages(id),
+    PRIMARY KEY (memory_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS memory_evidence_by_message ON memory_evidence (message_id);
+-- 只追加的事件：谁、何时、依据哪条消息，做了新增 / 取代 / 撤销
+CREATE TABLE IF NOT EXISTS memory_events (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id    uuid   NOT NULL REFERENCES users(id),
+    memory_id  bigint NOT NULL REFERENCES memory_items(id),
+    op         text   NOT NULL CHECK (op IN ('add', 'supersede', 'revoke')),
+    actor      text   NOT NULL CHECK (actor IN ('extractor', 'agent', 'user')),
+    run_id     uuid REFERENCES runs(id),
+    detail     jsonb  NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS memory_events_by_memory ON memory_events (memory_id, id);
+-- P2：抽取任务。run_id 主键 = 同一个 run 只抽一次；进程崩了，启动时把卡在 running 的放回 pending 补跑，最多 3 次
+CREATE TABLE IF NOT EXISTS memory_jobs (
+    run_id      uuid PRIMARY KEY REFERENCES runs(id),
+    user_id     uuid NOT NULL REFERENCES users(id),
+    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    attempts    int  NOT NULL DEFAULT 0,
+    result      jsonb,                         -- {add, update, delete, dropped}：各操作数，dropped = 校验没过被丢掉的
+    error       text,                          -- 只记异常类型
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    started_at  timestamptz,
+    finished_at timestamptz
+);
+-- P2：每个对话冻结一次的记忆摘要块（用户选 A）。NULL = 还没拼过；'' = 拼过但没有记忆。
+-- 第一个 run 拼好写进来，之后的 run 原样读：跨实例、跨重启都逐字一致，层 2 的前缀缓存才保得住
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS memory_block text;
+CREATE INDEX IF NOT EXISTS memory_jobs_open ON memory_jobs (created_at) WHERE status IN ('pending', 'running');
+-- P3：删除对话时恢复被作废条目取代过的旧条目，记 restore 事件
+ALTER TABLE memory_events DROP CONSTRAINT IF EXISTS memory_events_op_check;
+ALTER TABLE memory_events ADD CONSTRAINT memory_events_op_check CHECK (op IN ('add', 'supersede', 'revoke', 'restore'));
+
+-- P4：经验记忆（D7=A：门禁 L0+L1）。只对本人生效（用户选 A）。一条经验 = 一个结构化假设：前提 → 行为 → 预期效果 → 验证方式（FGSE）。
+-- 状态：candidate（刚提炼，待门禁）→ rejected（L0 或 L1 没过，gate 里写原因）/ active（过了 L1，开始注入）→ quarantined（上线后违反太多次）
+CREATE TABLE IF NOT EXISTS memory_lessons (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id      uuid NOT NULL REFERENCES users(id),
+    precondition text NOT NULL,                 -- 什么情况下适用
+    behavior     text NOT NULL,                 -- 该怎么做
+    expected     text NOT NULL,                 -- 照做后预期看到什么
+    verify       jsonb NOT NULL,                -- 验证方式：判分器的确定性检查 [{"name": "tool_called", "args": {...}}]，源任务回放用它判分
+    tools        text[] NOT NULL,               -- 这条经验管哪些工具（L0：必须在源轨迹里出现过）
+    rationale    text NOT NULL,                 -- 原因摘要：源 run 为什么失败、怎么救回来的（WikiTrace 的中间层；是解释，不是查证过的原因）
+    outcome      text NOT NULL CHECK (outcome IN ('failed', 'recovered', 'corrected')),  -- 源 run 的结局
+    source_run   uuid NOT NULL REFERENCES runs(id),
+    status       text NOT NULL DEFAULT 'candidate' CHECK (status IN ('candidate', 'rejected', 'active', 'quarantined')),
+    gate         jsonb NOT NULL DEFAULT '{}',   -- {"l0": {...}, "l1": {...}}：每道检验题的结果和判定理由
+    uses         int NOT NULL DEFAULT 0,
+    violations   int NOT NULL DEFAULT 0,
+    embedding    vector(1024),                  -- 前提的向量：读取时和当前问题比
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    decided_at   timestamptz
+);
+CREATE INDEX IF NOT EXISTS memory_lessons_active ON memory_lessons (user_id) WHERE status = 'active';
+-- 证据：经验 ↔ 源 run 里的消息和工具调用。tool_use_id 为 '' 表示引用整条用户消息；span 按 attrs->>'tool_use_id' 关联
+CREATE TABLE IF NOT EXISTS lesson_evidence (
+    lesson_id   bigint NOT NULL REFERENCES memory_lessons(id),
+    message_id  bigint NOT NULL REFERENCES messages(id),
+    tool_use_id text   NOT NULL DEFAULT '',
+    PRIMARY KEY (lesson_id, message_id, tool_use_id)
+);
+CREATE INDEX IF NOT EXISTS lesson_evidence_by_message ON lesson_evidence (message_id);
+-- 使用记录（用户选 A）：哪个 run 注入了哪条经验；violated = 注入后它管的工具反而失败了，run 结束时判
+CREATE TABLE IF NOT EXISTS lesson_uses (
+    lesson_id  bigint NOT NULL REFERENCES memory_lessons(id),
+    run_id     uuid   NOT NULL REFERENCES runs(id),
+    violated   boolean,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (lesson_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS lesson_uses_by_run ON lesson_uses (run_id);
+-- 扫描记录：每个 run 只扫一次（批量提炼可以反复跑，不重复花钱）。skipped = 没信号；done = 提炼过（result 里写几条候选）
+CREATE TABLE IF NOT EXISTS lesson_scans (
+    run_id     uuid PRIMARY KEY REFERENCES runs(id),
+    user_id    uuid NOT NULL REFERENCES users(id),
+    status     text NOT NULL CHECK (status IN ('running', 'skipped', 'done', 'failed')),
+    signals    text[] NOT NULL DEFAULT '{}',
+    result     jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);

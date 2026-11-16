@@ -58,8 +58,10 @@ def test_falls_back_only_on_overflow_recovery(error):
     assert summary.endswith(REFS_HEADING + '\n- get_stock {"symbol": "AAPL"} → ref=' + REF)  # ref 段照样由代码补
 
 
-def test_min_progress_guard():
-    """省不到 10% 不压。9 条没有工具调用的消息 → 切到最后一条：before = 90，after = 摘要字数 + 10。"""
+def test_min_progress_guard(monkeypatch):
+    """省不到 10% 不压。9 条没有工具调用的消息 → 切到最后一条：before = 90，after = 摘要字数 + 10。
+    这条只测守卫：P3-C3 的原话段会改变摘要字数，这里关掉（原话段在 test_compact_words 里测）。"""
+    monkeypatch.setattr(compaction, "user_words", lambda *a: "")
     plain = [text("assistant", "答") if i % 2 else {"role": "user", "content": "问"} for i in range(9)]
 
     def compact_with(n):
