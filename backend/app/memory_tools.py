@@ -77,9 +77,10 @@ async def tail_notes(user_id: UUID, block: str, conversation_id: UUID | None = N
             cur = await pool.fetchrow("SELECT id, content, status, superseded_by FROM memory_items "
                                       "WHERE id = $1 AND user_id = $2", cur["superseded_by"], user_id)
         if r["status"] == "superseded":
-            why = f"已被 #{cur['id']} 取代：{cur['content']}" if cur["status"] == "active" else "已失效"
+            why = f"已被 #{cur['id']} 取代：{context.ref('m', cur['id'])}" if cur["status"] == "active" else "已失效"
             named.add(cur["id"])
-        notes.append(f"\n记忆 #{r['id']}「{r['content']}」{why}。不要再按旧的回答。")
+        # P5 复核二（用户选 B）：尾部会落库，原文只写占位符，发请求时按现值展开（app/tail_refs.py）
+        notes.append(f"\n记忆 #{r['id']}「{context.ref('m', r['id'])}」{why}。不要再按旧的回答。")
     if conversation_id is not None:
         # 本对话的 run 写下的、现在有效、摘要块里没有的条目（memory_write 和后台抽取写的都算）；上面点过名的不重复
         fresh = await pool.fetch(
@@ -89,7 +90,8 @@ async def tail_notes(user_id: UUID, block: str, conversation_id: UUID | None = N
             "AND NOT (i.id = ANY($3::bigint[])) ORDER BY i.id DESC LIMIT $4",
             user_id, conversation_id, [*ids, *named], ECHO_MAX)
         if fresh:
-            notes.append(ECHO_HEAD + "".join(f"\n- [#{r['id']}] {r['content']}" for r in reversed(fresh)))
+            notes.append(ECHO_HEAD + "".join(f"\n- [#{r['id']}] {context.ref('m', r['id'])}"
+                                             for r in reversed(fresh)))
     return notes
 
 
@@ -130,8 +132,8 @@ async def last_user_words(conversation_id: UUID) -> tuple[int, str] | None:
     rows = await db.pool().fetch("SELECT id, role, content FROM messages WHERE conversation_id = $1 "
                                  "AND role = 'user' ORDER BY id DESC LIMIT 30", conversation_id)
     for r in rows:
-        if context.note_kind(dict(r)) is None and (t := "".join(
-                b.get("text", "") for b in r["content"] if b.get("type") == "text").strip()):
+        # P5：只认用户打的字，tool_result 后面落库的尾部块不算（否则「记住」的判断会读到尾部）
+        if context.note_kind(dict(r)) is None and (t := context.text_of(r["content"]).strip()):
             return r["id"], t
     return None
 

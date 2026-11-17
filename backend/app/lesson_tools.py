@@ -10,7 +10,7 @@ import logging
 import os
 from uuid import UUID
 
-from app import budget, compaction, context, db, lesson_store as ls, lesson_trace as lt, memory_store as ms
+from app import budget, compaction, context, db, lesson_store as ls, lesson_trace as lt, memory_store as ms, tail_refs
 from app.memory_search import terms
 
 log = logging.getLogger(__name__)
@@ -32,8 +32,8 @@ def enabled() -> bool:
 
 
 def line(x: dict) -> str:
-    src = "（来自失败的 run）" if x["outcome"] == "failed" else ""
-    return f"\n- [L{x['id']}] 前提：{x['precondition']}；做法：{x['behavior']}；预期：{x['expected']}{src}"
+    """展开后的样子（算预算用）。"""
+    return f"\n- [L{x['id']}] {tail_refs.lesson_body(x)}"
 
 
 async def select(user_id: UUID, query: str) -> list[dict]:
@@ -68,7 +68,8 @@ async def select(user_id: UUID, query: str) -> list[dict]:
 
 
 def render(lessons: list[dict]) -> str:
-    return HEAD + "".join(line(x) for x in lessons) + TAIL if lessons else ""
+    # P5 复核二：进尾部、会落库，只写占位符，发请求时展开；隔离 / 删除后展开成「已停用或已删除」
+    return HEAD + "".join(f"\n- [L{x['id']}] {context.ref('l', x['id'])}" for x in lessons) + TAIL if lessons else ""
 
 
 async def for_run(user_id: UUID, run_id: UUID, history: list[dict]) -> list[str]:

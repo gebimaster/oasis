@@ -8,7 +8,7 @@
 
 from uuid import UUID
 
-from app import db, memory_store as ms
+from app import db, memory_store as ms, tail_refs
 
 OUTCOMES = ("failed", "recovered", "corrected")
 QUARANTINE_MIN = 3  # 至少违反 3 次、并且违反次数过半，才自动隔离：一两次失败可能只是工具本身抖了一下
@@ -104,7 +104,17 @@ async def judge_uses(run_id: UUID, failed_tools: set[str]) -> list[int]:
         gone = await conn.fetch(
             "UPDATE memory_lessons SET status = 'quarantined', decided_at = now() WHERE id = ANY($1::bigint[]) "
             "AND status = 'active' AND violations >= $2 AND violations * 2 > uses RETURNING id", bad, QUARANTINE_MIN)
+        await _bump_owners(conn, [r["id"] for r in gone])  # P5 复核二：隔离也让展开结果变了
     return [r["id"] for r in gone]
+
+
+async def _bump_owners(conn, ids: list[int]) -> None:
+    """P5：尾部里的经验是占位符，删除 / 隔离后展开成「已停用或已删除」，引用它的对话前缀变了，按主人分组抬水位。"""
+    owners: dict = {}
+    for r in await conn.fetch("SELECT id, user_id FROM memory_lessons WHERE id = ANY($1::bigint[])", ids):
+        owners.setdefault(r["user_id"], []).append(r["id"])
+    for user_id, lids in owners.items():
+        await tail_refs.bump(conn, user_id, lesson_ids=lids)
 
 
 async def cascade(conn, runs: list[UUID], message_ids: list[int]) -> int:
@@ -116,5 +126,6 @@ async def cascade(conn, runs: list[UUID], message_ids: list[int]) -> int:
                        ids, runs)
     await conn.execute("DELETE FROM lesson_evidence WHERE lesson_id = ANY($1::bigint[])", ids)
     await conn.execute("DELETE FROM lesson_scans WHERE run_id = ANY($1::uuid[])", runs)
+    await _bump_owners(conn, ids)  # P5：删除前查主人（删了就查不到了）
     await conn.execute("DELETE FROM memory_lessons WHERE id = ANY($1::bigint[])", ids)
     return len(ids)

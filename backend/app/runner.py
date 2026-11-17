@@ -11,6 +11,7 @@ from uuid import UUID
 from app import (approvals, compaction, context, db, kb_tool, recall, subagent, subagent_tool,  # noqa: F401  import 即注册工具
                  memory_extract, memory_search, memory_tools,  # P2
                  lesson_tools,  # P4
+                 tail_refs,  # P5
                  tool_search, tools, trace, transfer, web_tools)
 from app.agent_loop import run_loop
 from app.hub import hub
@@ -222,10 +223,15 @@ async def _run(conversation_id: UUID, run_id: UUID, **loop_kwargs) -> None:
         block = await memory_tools.frozen_block(conversation_id, user["id"])  # P2：层 2 的记忆摘要块，每个对话只拼一次
         # 摘要块冻结了：过时的条目在尾部点名，本对话里新记下的在尾部回显
         mem_notes = await memory_tools.tail_notes(user["id"], block, conversation_id)
-        mem_notes += await lesson_tools.for_run(user["id"], run_id, history)  # P4：按本 run 的提问挑经验，进尾部
+        lessons = await lesson_tools.for_run(user["id"], run_id, history)  # P4：按本 run 的提问挑经验，进尾部
+        used: dict = {}  # P5 复核二：循环最后一次展开用的现值
         async for ev in run_loop(history, user_name=user["name"], summary=cp["summary"],
                                  compactor=compactor, model_stream=stream, memory_block=block, memory_notes=mem_notes,
-                                 cleared_until=cl["cleared_until_id"], **loop_kwargs):
+                                 lesson_notes=lessons,
+                                 cleared_until=cl["cleared_until_id"],
+                                 thinking_floor=max(cp["compacted_at_id"], cl["cleared_at_id"]),  # P5 第 4 条
+                                 ref_lookup=lambda keys: tail_refs.lookup(user["id"], keys), exp_state=used,
+                                 **loop_kwargs):
             if ev["type"] == "text_delta":
                 await w.text(ev["text"])
             elif ev["type"] == "message":
@@ -240,6 +246,11 @@ async def _run(conversation_id: UUID, run_id: UUID, **loop_kwargs) -> None:
                     msg["id"] = saved["message_id"]  # O4：回填给循环里的同一个对象，单轮压缩的水位要用它
                     return saved
                 await w.emit(save)
+            elif ev["type"] == "prefix_changed":  # P5 复核二：run 中途有引用的记忆 / 经验被删了
+                await w.emit(lambda: db.raise_floor(conversation_id))
+            elif ev["type"] == "tail":  # P5：尾部跟着消息落库；没有 id 的（O4 重放的副本）只在本 run 内存里留着
+                if (mid := ev["message"].get("id")) is not None:
+                    await w.emit(lambda mid=mid, c=ev["message"]["content"]: db.set_content(mid, c))
             elif ev["type"] == "cleared":  # O9：抬水位和事件同一个事务
                 await w.emit(lambda ev=ev: db.save_cleared(conversation_id, run_id, ev))
             elif ev["type"] == "run_end" and ev.get("approvals"):  # M5 挂起
@@ -253,6 +264,9 @@ async def _run(conversation_id: UUID, run_id: UUID, **loop_kwargs) -> None:
                 await w.emit(lambda: db.append_event(run_id, ev))
             if ev["type"] == "run_end" and ev["status"] == "completed":  # P2：正常结束（含挂起等审批）才抽记忆，后台跑
                 memory_extract.kick(run_id, user["id"])
+        # P5 复核二：删除发生在最后一次调用期间时，循环没有下一轮去发现；这里再查一次，变了就抬水位
+        if await tail_refs.changed(user["id"], used):
+            await db.raise_floor(conversation_id)
     except asyncio.CancelledError:
         try:
             # 有未收口的审批批次时不加标记：tool_use 后面必须先跟它的 tool_result，批次由下一条消息收口
@@ -292,7 +306,8 @@ async def run_child(conversation_id: UUID, run_id: UUID, ctx: tools.ToolContext,
         w.span = await trace.start("run", "subagent", run_id, parent=trace.current.get())
         trace.current.set(w.span)
         user = await db.conversation_user(conversation_id)
-        history = [{"role": m["role"], "content": m["content"]} for m in await db.list_messages(conversation_id)]
+        history = [{"id": m["id"], "role": m["role"], "content": m["content"]}  # P5：尾部写库要 id
+                   for m in await db.list_messages(conversation_id)]
         loop_kwargs["model_stream"] = trace.traced_llm(loop_kwargs.get("model_stream"), run_id)
         async for ev in run_loop(history, user_name=user["name"], persona=subagent.CONTRACT,
                                  **({"max_turns": SUBAGENT_MAX_TURNS,
@@ -305,8 +320,15 @@ async def run_child(conversation_id: UUID, run_id: UUID, ctx: tools.ToolContext,
                 if msg["role"] == "assistant":
                     for k, v in (msg.get("usage") or {}).items():
                         usage[k] = usage.get(k, 0) + v
-                await w.emit(lambda msg=msg: db.insert_message(conversation_id, run_id, msg["role"], msg["content"],
-                                                               usage=msg.get("usage")))
+                async def save(msg=msg):
+                    saved = await db.insert_message(conversation_id, run_id, msg["role"], msg["content"],
+                                                    usage=msg.get("usage"))
+                    msg["id"] = saved["message_id"]  # P5：回填，下一轮的尾部按它写库
+                    return saved
+                await w.emit(save)
+            elif ev["type"] == "tail":  # P5：同父 run
+                if (mid := ev["message"].get("id")) is not None:
+                    await w.emit(lambda mid=mid, c=ev["message"]["content"]: db.set_content(mid, c))
             elif ev["type"] == "run_end":
                 await db.save_run_usage(run_id, usage)
                 await w.finish(ev["status"], ev["stop_reason"], ev.get("error"))

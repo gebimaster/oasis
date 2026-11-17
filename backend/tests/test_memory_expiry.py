@@ -35,6 +35,15 @@ async def _invalid_at(memory_id):
     return await db.pool().fetchval("SELECT invalid_at FROM memory_items WHERE id = $1", memory_id)
 
 
+
+async def tn(user_id, *args):
+    """P5 复核二：尾部提醒里只有占位符，按发请求时的同一套规则展开再比。"""
+    from app import context, tail_refs
+    notes = await mt.tail_notes(user_id, *args)
+    keys = set().union(*(context.refs_in(n) for n in notes)) if notes else set()
+    table = await tail_refs.lookup(user_id, keys) if keys else {}
+    return [context.expand_text(n, table) for n in notes]
+
 def test_parse_valid_until():
     today = date(2026, 11, 13)
     dt = ms.parse_valid_until("2026-11-18", today)
@@ -66,7 +75,7 @@ def test_expired_leaves_block_but_is_kept_and_searchable():
         out = await msr._search_tool({"query": "成都出差"})
         assert f"（到 {SOON} 为止）" in out and "已过期" not in out
         assert f"有效期到 {SOON} 为止" in await mt._open({"id": trip})
-        assert await mt.tail_notes(alice, block, c1) == [mt.SNAPSHOT_NOTE]
+        assert await tn(alice, block, c1) == [mt.SNAPSHOT_NOTE]
 
         await _expire(trip)                                                           # —— 日子过去了 ——
         assert [i["id"] for i in await ms.active(alice)] == [pref]                    # 不再算「此刻成立」
@@ -82,7 +91,7 @@ def test_expired_leaves_block_but_is_kept_and_searchable():
         hits = (await msr.search(alice, "最近的安排"))[0]
         assert trip in [h["id"] for h in hits] and all("keyword" not in h["ranks"] for h in hits)
         assert "已过期，只到" in await mt._open({"id": trip})
-        notes = await mt.tail_notes(alice, block, c1)                                 # 旧对话的冻结块里还有它：尾部点名
+        notes = await tn(alice, block, c1)                                 # 旧对话的冻结块里还有它：尾部点名
         assert len(notes) == 2 and f"记忆 #{trip}「用户要去成都出差」已过期（只到" in notes[1]
         assert c2 is not None
     with_fresh_db(body)
@@ -155,9 +164,9 @@ def test_memory_write_valid_until_and_echo_skips_expired():
         assert f"有效期到 {SOON} 为止" in out and ms.fmt_until(trip["invalid_at"]) == SOON.isoformat()
         out = await mt._write({"kind": "commitment", "content": "日期乱写的", "valid_until": "soon"})
         assert "已记住" in out and "有效期" not in out                               # 日期不合法：照常记，不带期限
-        echo = (await mt.tail_notes(uid, block, cid))[1]
+        echo = (await tn(uid, block, cid))[1]
         assert f"[#{trip['id']}]" in echo
         await _expire(trip["id"])
-        echo = (await mt.tail_notes(uid, block, cid))[1]
+        echo = (await tn(uid, block, cid))[1]
         assert f"[#{trip['id']}]" not in echo and "日期乱写的" in echo and seed is not None   # 过期的不回显
     with_fresh_db(body)

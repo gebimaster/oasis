@@ -33,23 +33,33 @@ class Model:
         return next((v for k in self.key_env if (v := os.getenv(k))), None)
 
 
+# P5：Claude 官方要标断点才缓存；DeepSeek 的 /anthropic 端点文档说忽略 cache_control，但没实测，不发（用户选 A）
+# bound_thinking（第 4 条）：thinking 签名绑定它之前的全部内容（preserved thinking 的前缀检查），自己压缩后要删掉过期的
+CLAUDE_COMPAT = {"cache_breakpoints": True, "bound_thinking": True}
+
 # 价格、窗口取自 pi-ai catalog/providers/deepseek.ts（注明来源：DeepSeek 官方定价页）
 _DS = dict(context_window=1_000_000, max_output=384_000, reasoning=True, cost=(0.3, 1.2, 0.006))
+# P5 第 3 条：收尾轮的软 none 发成 auto（DeepSeek 的 none 等于拿掉工具定义，整段缓存失效）。Claude、OpenAI 文档都推荐 none，不开
+DS_COMPAT = {"final_turn_auto": True}
 
 MODELS: dict[str, Model] = {
     # 改造前就在用的：DeepSeek 的 Anthropic 兼容端点，地址读 ANTHROPIC_BASE_URL
-    "deepseek-flash": Model(ANTHROPIC, "deepseek-flash", **_DS),
+    "deepseek-flash": Model(ANTHROPIC, "deepseek-flash", **_DS, compat=dict(DS_COMPAT)),
     # 同一个模型走 OpenAI Chat 协议；本机 .env 里 DeepSeek 的 key 放在 ANTHROPIC_API_KEY，所以兜底读它
     "deepseek-flash@openai": Model(OPENAI_CHAT, "deepseek-flash", base_url="https://api.deepseek.com",
                                    key_env=("DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"), **_DS,
                                    # 同 pi-ai DEEPSEEK compat；实测 OpenAI 端点默认不思考（Anthropic 端点默认思考），显式打开对齐
-                                   compat={"reasoning_content_required": True,
+                                   compat={**DS_COMPAT, "reasoning_content_required": True,
                                            "extra_body": {"thinking": {"type": "enabled"}}}),
-    "claude-opus-5-5": Model(ANTHROPIC, "claude-opus-5-5", reasoning=True),  # 窗口/价格未核实，先用默认值
+    "claude-opus-5-5": Model(ANTHROPIC, "claude-opus-5-5", reasoning=True,  # 窗口/价格未核实，先用默认值
+                             compat=dict(CLAUDE_COMPAT)),
 }
 
 
 def resolve(name: str | None = None) -> Model:
     """查不到的名字按 Anthropic 协议原样透传（改造前的行为），不让新增模型名直接报错。"""
     name = name or os.getenv("MODEL", "claude-opus-5-5")
-    return MODELS.get(name) or Model(ANTHROPIC, name)
+    if name in MODELS:
+        return MODELS[name]
+    # P5：没登记的 claude-* 也是 Claude 官方，同样要打断点（否则换个型号就 0 命中）
+    return Model(ANTHROPIC, name, compat=dict(CLAUDE_COMPAT) if name.startswith("claude-") else {})

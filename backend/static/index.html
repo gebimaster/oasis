@@ -69,6 +69,7 @@ function render() {
   const log = $("log"); log.innerHTML = "";
   for (const m of [...messages.values()].sort((a, b) => a.id - b.id)) {
     for (const b of m.content) {
+      if (b._tail) continue;             // P5：落库的运行时尾部（时间、提醒）是给模型看的，不展示
       const div = document.createElement("div");
       if (b.type === "text" && m.role === "user" && LOOP_NOTE.test(b.text)) {  // O7：循环插的续写 / 空回复提示，不是用户说的话
         div.className = "msg note";

@@ -263,7 +263,7 @@ def render(messages: list[dict]) -> str:
     for m in messages:
         blocks = [{"type": "text", "text": m["content"]}] if isinstance(m["content"], str) else m["content"]
         for b in blocks:
-            if b.get("type") == "text":
+            if b.get("type") == "text" and not context.is_tail(b):  # P5：运行时尾部不进摘要
                 lines.append(f"[{m['role']}] {b['text']}")
             elif b.get("type") == "tool_use":
                 lines.append(f"[assistant 调用工具] {b['name']}({json.dumps(b['input'], ensure_ascii=False)})")

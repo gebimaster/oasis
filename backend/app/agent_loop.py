@@ -103,7 +103,9 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                    summary: str | None = None, compactor: Callable | None = None,
                    limits: dict | None = None, persona: str = context.PERSONA,
                    context_limit: int | None = None, cleared_until: int = 0,
-                   memory_block: str = "", memory_notes: list[str] = ()) -> AsyncIterator[dict]:
+                   memory_block: str = "", memory_notes: list[str] = (),
+                   lesson_notes: list[str] = (), thinking_floor: int = 0,
+                   ref_lookup: Callable | None = None, exp_state: dict | None = None) -> AsyncIterator[dict]:
     """messages 是水位之后的原文（可带 status/usage/id）；summary 是已有摘要。
     compactor 由 runner 注入（循环不碰数据库）；model_stream、now、limits 可注入做测试；persona 子智能体换成合同。
     context_limit（M7 子智能体预算）：某一轮的上下文超过它，下一轮就当最后一轮（不许调工具、必须交汇报）。
@@ -115,14 +117,43 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
     turn, json_retries, pauses, compactions = 0, 0, 0, 0
     over_budget = False  # M7：上下文超了预算，下一轮强制收尾（复用 max_turns 的最后一轮）
     retried_final = False  # O3：收尾轮违约后已经多给过一次纯文本机会
+    hard_final = False  # P5 第 3 条：收尾轮里模型还是出了 tool_use（含被截断的），之后一律硬 none
     recovered: set[int] = set()  # O4：超窗被动恢复过的轮次
     windowed = False  # O4：截过窗口后 history 不完整，本 run 不再压缩（再压会让水位越过没摘要过的原文）
     continuations, empties, stream_retries = 0, 0, 0  # O7：续写（本 run 累计）、空回复提醒、流中途重试（本轮）
     repeats, outages = loop_guard.RepeatGuard(), loop_guard.UnavailableGuard()  # O6：本 run 的两种熔断计数
     breaker: tuple[str, str, int] | None = None  # O6：(stop_reason, 工具名, 次数)。非空 = 下一轮强制总结（复用收尾轮）
+    # P5 第 4 条（用户选 A）：id <= thinking_floor 的 assistant 产生时，前面的历史和现在不一样了（压缩 / 清理 / 截窗口
+    # 换掉了它的前缀），它的 thinking 在 Claude 5 上签名过期。runner 从库里给初值，本 run 里每改一次前缀就抬到当前最大 id
+    floor = thinking_floor
+
+    def raise_floor():
+        nonlocal floor
+        floor = max([floor] + [m["id"] for m in history if m.get("id") is not None])
+
+    # P5 复核二（用户选 B）：尾部里记忆、经验只有占位符。ref_lookup 由 runner 注入（循环不碰库），每轮按编号查一次现值；
+    # 发出去的副本展开，落库的仍是占位符。exp_state 交回 runner：run 结束后它再查一次，看最后一次调用期间有没有被删
+    table: dict = {}
+    exp_state = exp_state if exp_state is not None else {}
+
+    async def refresh() -> bool:
+        """返回 True = 和上一轮比，有引用的内容变了（删了、隔离了）：那个尾部之后的 thinking 签名过期。"""
+        nonlocal table
+        keys = context.history_refs(history) | context.refs_in("".join(memory_notes) + "".join(lesson_notes))
+        if ref_lookup is None or not keys:
+            return False
+        new = await ref_lookup(keys)
+        moved = any(new.get(k) != v for k, v in table.items() if k in keys)
+        table = new
+        exp_state.clear()
+        exp_state.update({k: new.get(k) for k in keys})
+        return moved
 
     while True:
         turn += 1
+        if await refresh():
+            raise_floor()
+            yield {"type": "prefix_changed"}  # runner 把对话的 cleared_at_id 抬上去（下个 run 也认）
         # 最后一轮：仍带 tools 定义（历史里有 tool_use），但禁止调用
         last = turn >= max_turns or over_budget or breaker is not None
         end_reason = breaker[0] if breaker else ("budget" if over_budget else "max_turns")
@@ -135,10 +166,11 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
         final = None
 
         def shape(s, h, instruction=None):  # 每轮都重新拼：history 在变，时间在变；最后一轮的提示、重复提醒都进尾部，不动 system
-            return context.build_request(user_name=user_name, summary=s, history=h,
+            return context.build_request(user_name=user_name, summary=s, history=context.mark_stale(h, floor),
                                          now=now(), final_turn=last, catalog=tools.deferred_catalog(),
                                          loaded_defs=tools.definitions(tools.context().loaded), persona=persona,
-                                         notes=[compaction.status_note(s), *memory_notes, *notes],  # P3-C5
+                                         notes=notes, status=compaction.status_note(s),  # P3-C5
+                                         memory="".join(memory_notes), lessons="".join(lesson_notes),  # P5：按段比对
                                          instruction=instruction,
                                          memory_block=memory_block)  # P2：记忆的提醒进尾部，不动层 2
 
@@ -149,7 +181,7 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
             """P1-C1：摘要请求和正常请求同一套拼法、同一份 tools，只把尾部换成压缩指令。
             h 是 compact 交给 compactor 的那份（已投影过），不再投影：再投影一次字节会变，前缀就对不上了。"""
             sys_, msgs = shape(s, h, instruction)
-            return {"system": sys_, "messages": msgs, "tools": tool_defs}
+            return {"system": sys_, "messages": context.expand(msgs, table), "tools": tool_defs}  # P5：同正常请求
 
         async def compact(h, s, room, **kw):  # kw：C4 的 fallback 只在超窗恢复时给
             """O9 复核③：摘要那一级按投影量长度、做摘要（清掉的结果模型本来就看不到，不该再按原文切、再喂给摘要），
@@ -180,6 +212,7 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                 history = compaction.strip_usage(history)  # 那些 usage 是清理前的大请求，打底会立刻又判超线
                 yield {"type": "cleared", "until_id": w, "at_id": max(m.get("id") or 0 for m in history),
                        "tokens_before": before, "tokens_after": measure(summary, history)}
+                raise_floor()
                 system, request_msgs = build(summary, history)
         # 超过触发线就压到目标线；每个 run 最多压 MAX_COMPACTIONS 次，用完照发
         if (compactor and not windowed and compactions < MAX_COMPACTIONS and budget.request_tokens(
@@ -194,14 +227,23 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                 yield {"type": "compacted", "reason": "trigger", "kept_messages": len(history),
                        "summary_chars": len(summary),
                        "tokens_before": before, "tokens_after": measure(summary, history), **compact_stats()}
+                raise_floor()
                 system, request_msgs = build(summary, history)
+        # P5：尾部存回最后一条 user 消息（同一个对象，runner 按 id 写库）。下一轮它就是历史：Claude 的 thinking 签名、
+        # DeepSeek 请求边界的缓存单元都对得上。放在压缩之后、发请求之前：摘要请求不带本轮尾部，和 P1-C1 一致
+        if history and history[-1]["role"] == "user" and not context.has_tail(history[-1])                 and context.has_tail(request_msgs[-1]):
+            history[-1]["content"] = context._as_blocks(history[-1]["content"]) + [request_msgs[-1]["content"][-1]]
+            yield {"type": "tail", "message": history[-1]}
         emitted = False  # O7 水位：这次调用推出过文字没有
         try:
             async for ev in model_stream(
                 system=system,
-                messages=request_msgs,
+                messages=context.expand(request_msgs, table),  # P5：落库的是占位符，发出去的展开
                 tools=tool_defs,
-                tool_choice={"type": "none"} if last else {"type": "auto"},
+                # P5 第 3 条：收尾轮第一次是「软 none」，协议层按模型决定（DeepSeek 发 auto 靠尾部提示，保住缓存）；
+                # 违约后的第二次机会是硬 none，一律禁止
+                tool_choice=({"type": "none", "soft": True} if not hard_final else {"type": "none"}) if last
+                else {"type": "auto"},
             ):
                 if ev["type"] == "text_delta":
                     emitted = True
@@ -241,6 +283,7 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
                            "summary_chars": len(summary or ""), "tokens_before": before,
                            "tokens_after": measure(summary, history),
                            **(compact_stats() if reason == "overflow" else {"mode": "window", "summary_hit_rate": None})}
+                    raise_floor()
                     turn -= 1
                     continue
             yield {"type": "run_end", "status": "failed", "stop_reason": kind, "error": str(e)}
@@ -267,6 +310,7 @@ async def run_loop(messages: list[dict], *, model_stream: Callable | None = None
         # 执不执行看内容里有没有 tool_use，不看 stop_reason：
         # end_turn 却带 tool_use 照样执行；但被拒、被截断、收尾轮的一律不执行
         tool_uses = [b for b in final["content"] if b.get("type") == "tool_use"]
+        hard_final = hard_final or bool(last and tool_uses)
         if stop == "max_tokens":  # O7：截断续写。先补「未执行」（配对），额度用完就停；没用完就续写，不占轮数
             continuations += 1
             if tool_uses:  # 续写提示就是这条拒绝结果本身（让它重新调用、入参写短），不另加

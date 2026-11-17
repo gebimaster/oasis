@@ -233,6 +233,18 @@ async def insert_message(conversation_id: UUID, run_id: UUID, role: str, content
         return await _insert_message(conn, conversation_id, run_id, role, content, usage=usage)
 
 
+async def raise_floor(conversation_id: UUID) -> None:
+    """P5 复核二：前缀在此刻之前变了（尾部引用的记忆 / 经验被删），之前的 thinking 和用量都作废。"""
+    await pool().execute("UPDATE conversations c SET cleared_at_id = GREATEST(c.cleared_at_id, "
+                         "(SELECT COALESCE(max(id), 0) FROM messages WHERE conversation_id = c.id)) WHERE c.id = $1",
+                         conversation_id)
+
+
+async def set_content(message_id: int, content: list[dict]) -> None:
+    """P5：运行时尾部存回这条消息（只会在末尾追加一个尾部块）。"""
+    await pool().execute("UPDATE messages SET content = $2 WHERE id = $1", message_id, content)
+
+
 async def list_messages(conversation_id: UUID, from_id: int = 0) -> list[dict]:
     """from_id：只取水位之后的原文（拼给模型用）；前端展示传 0 取全部。"""
     rows = await pool().fetch(
@@ -256,6 +268,7 @@ CROSS JOIN LATERAL (
     FROM jsonb_array_elements(m.content) b
     WHERE NOT (b->>'type' = 'tool_use' AND b->>'name' = $5)
       AND NOT (b->>'type' = 'tool_result' AND starts_with(b->>'content', $6))
+      AND NOT b ? '_tail'                                -- P5：落库的运行时尾部不是对话内容
 ) t
 WHERE c.user_id = $1                                     -- 只搜本人的会话（身份来自服务端，不来自模型）
   AND NOT (m.conversation_id = $2 AND m.id >= c.keep_from_id)  -- 已在上下文里的不返回

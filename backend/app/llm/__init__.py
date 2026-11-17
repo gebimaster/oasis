@@ -44,8 +44,13 @@ async def complete_with_stop(*, system: str, prompt: str, max_tokens: int = 4000
 async def stream_message(*, system: list[dict], messages: list[dict], tools: list[dict],
                          tool_choice: dict) -> AsyncIterator[dict]:
     m = resolve()
+    tc = {k: v for k, v in tool_choice.items() if k != "soft"}  # soft 不是 API 字段
+    if tool_choice.get("soft") and m.compat.get("final_turn_auto"):
+        # P5 第 3 条（用户选 A）：DeepSeek 处理 none 是把工具定义拿掉（O3 实测第一次切过去整段 0 命中）。
+        # 收尾轮改发 auto、只靠尾部的「不要再调用工具」：实测违约 0/30、命中 93%；违约了循环补拒绝结果、第二次发硬 none
+        tc = {"type": "auto"}
     async for ev in _provider(m).stream_message(m, system=system, messages=messages, tools=tools,
-                                                tool_choice=tool_choice):
+                                                tool_choice=tc):
         # O6 第二轮复核①：清洗 tool 入参里的孤立代理。只有 OpenAI Chat 协议能走到这里带着孤立代理；
         # Anthropic 协议下 SDK 的 jiter 先拒收、抛 ValueError（见 transform.scrub_tool_inputs）
         if ev["type"] == "final":

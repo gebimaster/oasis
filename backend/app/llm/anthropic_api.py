@@ -31,9 +31,23 @@ async def complete_with_stop(model: Model, *, system: str, prompt: str, max_toke
     return "".join(b.text for b in resp.content if b.type == "text").strip(), resp.stop_reason
 
 
+EPHEMERAL = {"type": "ephemeral"}
+
+
+def cache_kwargs(model: Model, system: list[dict]) -> tuple[list[dict], dict]:
+    """P5 第 2 条（用户选 A/A）：只给开了 cache_breakpoints 的模型（Claude 官方）打断点，DeepSeek 请求字节不变。
+    两个断点：system 最后一块（前缀顺序 tools → system → messages，所以也盖住了 tools；收尾轮换 tool_choice
+    只让 messages 段失效，这一段照样命中）+ 顶层自动断点（标在最后一块上、随对话往前移；P5 尾部落库后最后一块
+    下一轮就是历史，所以能被读到）。上限 4 个，这里用 2 个。返回新的 system 副本，不改调用方的。"""
+    if not model.compat.get("cache_breakpoints") or not system:
+        return system, {}
+    return system[:-1] + [{**system[-1], "cache_control": EPHEMERAL}], {"cache_control": EPHEMERAL}
+
+
 async def stream_message(model: Model, *, system: list[dict], messages: list[dict], tools: list[dict],
                          tool_choice: dict) -> AsyncIterator[dict]:
     max_tokens = int(os.getenv("MAX_TOKENS", "64000"))
+    system, cache = cache_kwargs(model, system)
     t0, first = time.monotonic(), None  # O3 首字时间：发请求 → 第一个内容增量（thinking / 正文 / 工具入参都算）
     # O7：拿到响应头以后（进了 async with）SDK 就不再重试，之后的失败标 mid_stream 交给循环决定。
     # 复核②：初版在收到第一个事件时才置位，第一个 SSE 事件就是 error（过载）时，SDK 和循环都不重试
@@ -41,7 +55,7 @@ async def stream_message(model: Model, *, system: list[dict], messages: list[dic
     try:
         async with _get_client(model).messages.stream(
             model=model.id, max_tokens=max_tokens, system=system,
-            messages=replay(messages, model), tools=tools, tool_choice=tool_choice,
+            messages=replay(messages, model), tools=tools, tool_choice=tool_choice, **cache,
         ) as stream:
             started = True
             async for event in stream:  # 入参 JSON 彻底解析失败时，这里会抛 ValueError（不包，循环靠它重发）

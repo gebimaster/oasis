@@ -43,7 +43,8 @@ def urls_in(text: str) -> set[str]:
 def seen_from_history(history: list[dict]) -> set[str]:
     """用户自己贴过的链接：只看 user 的文字块，不看 tool_result（那是外部数据）。"""
     return {u for m in history if m["role"] == "user" and isinstance(m["content"], list)
-            for b in m["content"] if b.get("type") == "text" for u in urls_in(b["text"])}
+            for b in m["content"] if b.get("type") == "text" and "_tail" not in b  # P5：尾部里的 ref 不是用户贴的
+            for u in urls_in(b["text"])}
 
 
 def _fetch_risk(ctx: tools.ToolContext, args: dict) -> str:

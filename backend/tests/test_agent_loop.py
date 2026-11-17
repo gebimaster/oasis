@@ -56,8 +56,8 @@ def test_tool_then_answer():
     ])
     events = run(USER, stream)
     types = [e["type"] for e in events]
-    assert types == ["text_delta", "message", "tool_start", "tool_end", "message",
-                     "text_delta", "message", "run_end"]
+    assert types == ["tail", "text_delta", "message", "tool_start", "tool_end", "message",
+                     "tail", "text_delta", "message", "run_end"]  # P5：每轮发请求前先把尾部存回最后一条 user
     assert events[-1] == {"type": "run_end", "status": "completed", "stop_reason": "end_turn"}
     # 第 2 轮收到的历史：[0] 是会话上下文；thinking 块原样传回，tool_result 紧跟在后面
     second = calls[1]["messages"]
@@ -69,7 +69,7 @@ def test_tool_then_answer():
 def test_max_turns_last_turn_sets_tool_choice_none():
     stream, calls = fake_model([([CALL], "tool_use")] * 2 + [([{"type": "text", "text": "总结"}], "end_turn")])
     events = run(USER, stream, max_turns=3)
-    assert [c["tool_choice"] for c in calls] == [{"type": "auto"}, {"type": "auto"}, {"type": "none"}]
+    assert [c["tool_choice"] for c in calls] == [{"type": "auto"}, {"type": "auto"}, {"type": "none", "soft": True}]
     assert calls[0]["system"] == calls[2]["system"]  # 最后一轮的提示进尾部，不动 system
     assert "工具调用上限" in calls[2]["messages"][-1]["content"][-1]["text"]
     assert events[-1]["stop_reason"] == "max_turns" and events[-1]["status"] == "completed"
@@ -480,7 +480,7 @@ def test_duplicates_in_one_batch_count_each(fast_tools):
     """同一批里出现几次就算几次（你选的 F1-ii）：一批 5 个相同调用，当场到硬阈值，下一轮就收尾。"""
     stream, calls = fake_model([([rep(i) for i in range(1, 6)], "tool_use"), TEXT])
     events = run(USER, stream)
-    assert len(calls) == 2 and calls[1]["tool_choice"] == {"type": "none"}
+    assert len(calls) == 2 and calls[1]["tool_choice"]["type"] == "none"
     assert events[-1]["stop_reason"] == "repeated_action"
 
 
@@ -494,7 +494,7 @@ def test_polling_tool_gets_double_thresholds(fast_tools):
     assert "连续" not in tail(calls[5]) and "连续 6 次" in tail(calls[6]) and "连续 9 次" in tail(calls[9])
     assert all(a == "nudge" for a, _, _ in guard_events(events))
     # 复核①：最后一轮（tool_choice none）不能再说「可以继续」，换成说明原因、要求直接回答的版本（你选的 B）
-    assert calls[9]["tool_choice"] == {"type": "none"} and "可以继续" not in tail(calls[9])
+    assert calls[9]["tool_choice"]["type"] == "none" and "可以继续" not in tail(calls[9])
     assert "不能再调用工具" in tail(calls[9])
 
 
@@ -504,7 +504,7 @@ def test_last_turn_nudge_does_not_contradict_final_note(fast_tools):
     stream, calls = fake_model(REPEAT5[:4] + [TEXT])
     events = run(USER, stream, max_turns=5)
     last_tail = tail(calls[4])
-    assert calls[4]["tool_choice"] == {"type": "none"} and "工具调用上限" in last_tail
+    assert calls[4]["tool_choice"]["type"] == "none" and "工具调用上限" in last_tail
     assert "连续 4 次" in last_tail and "不能再调用工具" in last_tail and "换参数" not in last_tail
     assert "换参数" in tail(calls[3])  # 不是最后一轮时照旧提醒换办法
     assert events[-1] == {"type": "run_end", "status": "completed", "stop_reason": "max_turns"}
@@ -532,7 +532,7 @@ def test_unavailable_trips_after_2_even_with_new_args(failing_tools):
     调模型 3 次，远少于 max_turns；判 completed（服务挂了不是模型的错，你选的 R3）。"""
     stream, calls = fake_model([([d(1, 1)], "tool_use"), ([d(2, 2)], "tool_use"), TEXT])
     events = run(USER, stream)
-    assert len(calls) == 3 and calls[2]["tool_choice"] == {"type": "none"}
+    assert len(calls) == 3 and calls[2]["tool_choice"]["type"] == "none"
     note = tail(calls[2])
     for phrase in ("down", "不可用", "没有返回任何数据", "不要编造", "已拿到", "没拿到", "下一步"):
         assert phrase in note, phrase

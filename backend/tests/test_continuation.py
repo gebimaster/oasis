@@ -70,7 +70,7 @@ def test_truncated_tool_input_is_never_executed(inp):
     stream, calls = fake_model([([tool, {**CALL, "id": "c2"}], "max_tokens"), say("重新来")])
     events = run(USER, stream)
     assert "tool_start" not in [e["type"] for e in events]  # 看起来合法的也不执行，同批完整的也不执行
-    rejected = saved(events)[1]["content"]
+    rejected = [b for b in saved(events)[1]["content"] if "_tail" not in b]  # P5：下一轮把尾部挂在它后面
     assert [b["tool_use_id"] for b in rejected] == ["c1", "c2"]
     assert all(b["is_error"] and context.TRUNCATED_TOOL_NOTE in b["content"] for b in rejected)
     assert context.is_truncation_reject(saved(events)[1])  # 评测数续写次数时它也算一次

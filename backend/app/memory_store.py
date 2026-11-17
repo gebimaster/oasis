@@ -9,7 +9,7 @@
 from datetime import date, datetime, time
 from uuid import UUID
 
-from app import db
+from app import db, tail_refs
 
 KINDS = ("preference", "fact", "commitment", "note")
 SOURCES = ("user_stated", "agent_inferred", "tool_derived")
@@ -203,6 +203,8 @@ async def forget(user_id: UUID, memory_id: int) -> bool:
         if n:
             await _event(conn, user_id, memory_id, "revoke", "user", None, {"reason": "user_deleted"})
             await _forget_blocks(conn, user_id, [memory_id])
+            # P5：尾部里只有占位符，内容抹掉后展开成「已删除」：前缀从这里变了，之前的 thinking 作废
+            await tail_refs.bump(conn, user_id, memory_ids=[memory_id])
     return bool(n)
 
 
@@ -234,4 +236,5 @@ async def cascade_messages(conn, user_id: UUID, message_ids: list[int]) -> dict:
     for r in restored:
         await _event(conn, user_id, r["id"], "restore", "user", None, {"after_revoke": True})
     await _forget_blocks(conn, user_id, wiped)
+    await tail_refs.bump(conn, user_id, memory_ids=wiped)  # P5：同 forget
     return {"revoked": revoked, "wiped": wiped, "restored": [r["id"] for r in restored]}

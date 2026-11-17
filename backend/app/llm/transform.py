@@ -35,6 +35,8 @@ def tag_thinking(content: list[dict], model: Model) -> list[dict]:
 def _keep(block: dict, model: Model) -> bool:
     if block.get("type") not in THINKING:
         return True
+    if block.get("_stale") and model.compat.get("bound_thinking"):  # P5 第 4 条：前缀换过的 thinking，Claude 5 上删掉
+        return False
     src = block.get(SRC)
     return src == model.source if src else model.api == ANTHROPIC
 
@@ -45,9 +47,11 @@ def replay(messages: list[dict], model: Model) -> list[dict]:
     for m in messages:
         content = m.get("content")
         if m.get("role") == "assistant" and isinstance(content, list):
-            content = [{k: v for k, v in b.items() if k != SRC} for b in content if _keep(b, model)]
+            content = [{k: v for k, v in b.items() if k not in (SRC, "_stale")} for b in content if _keep(b, model)]
             if not content:  # 只剩 thinking 被丢光的空 assistant：服务端不收空消息
                 continue
             m = {**m, "content": content}
+        elif isinstance(content, list) and any("_tail" in b for b in content):  # P5：尾部块的 _tail 只给自己看
+            m = {**m, "content": [{k: v for k, v in b.items() if k != "_tail"} for b in content]}
         out.append(m)
     return out

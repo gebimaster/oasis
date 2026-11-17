@@ -50,7 +50,7 @@ async def run_input(run_id: UUID) -> tuple[list[tuple[int, str]], str]:
     said, reply = [], ""
     for r in rows:
         if r["role"] == "user" and context.note_kind(dict(r)) is None:
-            t = "".join(b.get("text", "") for b in r["content"] if b.get("type") == "text").strip()
+            t = context.text_of(r["content"]).strip()  # P5：跳过落库的尾部块（里面有记忆回显，抽了会自我强化）
             if t:
                 said.append((r["id"], t[:USER_CHARS]))
         elif r["role"] == "assistant" and (t := context.text_of(r["content"]).strip()):

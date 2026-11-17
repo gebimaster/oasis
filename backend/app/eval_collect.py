@@ -23,7 +23,7 @@ PRICES = {"deepseek-flash": (0.006, 0.3, 1.2), "deepseek-v4-pro": (0.044, 1.32, 
 
 
 def _text(content) -> str:
-    return "".join(b.get("text", "") for b in content if b.get("type") == "text") if isinstance(content, list) else str(content)
+    return "".join(b.get("text", "") for b in content if b.get("type") == "text" and "_tail" not in b) if isinstance(content, list) else str(content)
 
 
 def extract_calls(messages: list[dict]) -> list[dict]:

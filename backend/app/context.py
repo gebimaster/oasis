@@ -5,11 +5,13 @@ DeepSeek 忽略 cache_control，但会自动做前缀缓存（实测同一 syste
   层1 system：平台规则 → 工具说明 → 人设（发版才变）
   层2 会话上下文：一条 user 消息（用户名、延迟工具名录，整个会话不变）
   层3 历史：摘要 + 已加载工具的定义（只在有摘要时补，M4）+ 水位线之后的原文
-  层4 运行时尾部：当前时间、最后一轮提示；只拼在发出去的副本上，不落库
+  层4 运行时尾部：当前时间、最后一轮提示等；P5 起由循环存回最后一条 user 消息（按段只写变了的），之后就是历史
 """
 
+import hashlib
 import json
 import os
+import re
 from datetime import datetime
 
 PLATFORM = "你运行在 oasis 平台上，这是一个多用户的在线 Agent 服务。"
@@ -59,6 +61,94 @@ def _as_blocks(content) -> list[dict]:
     return [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
 
 
+# P5：运行时尾部跟着消息落库（用户选 A）。尾部块是带 _tail 键的 text 块，_tail 记下这次写了哪些「按段比对」的段
+# （存指纹不存原文：原文已经在 text 里，再存一份会让库和本地 token 估算都多算一遍）。
+# _tail 不是 API 字段，transform.replay 发出前剥掉；用户输入进来时是字符串，伪造不出这个键
+TAIL = "_tail"
+DIFFED = ("status", "memory", "lessons")  # 和历史里最近一次一样就不再写；时间、收尾提示、重复提醒每轮都写
+
+
+def is_tail(b: dict) -> bool:
+    return isinstance(b, dict) and TAIL in b
+
+
+def has_tail(m: dict) -> bool:
+    return isinstance(m.get("content"), list) and any(is_tail(b) for b in m["content"])
+
+
+def mark_stale(history: list[dict], floor: int) -> list[dict]:
+    """P5 第 4 条：id <= floor 的 assistant 消息，thinking 块加 _stale 标记（副本，不动原文）。
+    要不要真删由协议层按模型决定（transform.replay：Claude 删，DeepSeek 只剥标记）。删的总是最早那一批，不会留空洞。"""
+    if floor <= 0:
+        return history
+    return [{**m, "content": [{**b, "_stale": True} if b.get("type") in ("thinking", "redacted_thinking") else b
+                              for b in m["content"]]}
+            if m["role"] == "assistant" and isinstance(m["content"], list) and (m.get("id") or 0) and m["id"] <= floor
+            else m for m in history]
+
+
+def fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def shown_sections(msgs: list[dict]) -> dict[str, str]:
+    """历史里还看得见的尾部：每段取最近一次写下的指纹（压缩摘掉的旧尾部自然不算）。"""
+    seen: dict[str, str] = {}
+    for m in msgs:
+        if isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if is_tail(b):
+                    seen.update({k: v for k, v in b[TAIL].items() if k in DIFFED})
+    return seen
+
+
+# P5 复核二（用户选 B）：尾部里的记忆、经验原文不落库。提醒里只写占位符 ⟦m:12⟧ / ⟦l:3⟧，存进库、进单轮压缩
+# 副本的都是占位符；发请求前（循环每轮）按库里此刻的状态展开。删了、隔离了，下一次就展开成「已删除 / 已停用」。
+# 内容不变时展开结果逐字不变，前缀照样稳定。只展开尾部块里的占位符：用户自己打的同样字样不动
+# 发布前复核三：位数封顶 18，任何能匹配上的编号都放得进 bigint，查库不会因溢出整轮失败
+REF = re.compile(r"⟦([ml]):(\d{1,18})⟧")
+GONE = {"m": "（这条记忆已删除）", "l": "（这条经验已停用或已删除）"}
+
+
+def defang(text: str) -> str:
+    """状态块（摘自模型写的摘要，可能照抄用户打的字）和循环提示里的 ⟦ 换成形近字，
+    这样尾部里能被展开、被记进 _tail.refs 的占位符只会来自代码自己拼的记忆段和经验段。"""
+    return text.replace("⟦", "〚")
+
+
+def ref(kind: str, i: int) -> str:
+    return f"⟦{kind}:{i}⟧"
+
+
+def refs_in(text: str) -> set[tuple[str, int]]:
+    return {(k, int(i)) for k, i in REF.findall(text)}
+
+
+def tail_refs(wrote_texts: dict[str, str]) -> dict[str, list[int]]:
+    """写进 _tail.refs：删除时按它找到引用了这些编号的对话（tail_refs.bump 抬水位）。"""
+    found = refs_in("".join(wrote_texts.values()))
+    refs = {k: sorted(i for kk, i in found if kk == k) for k in ("m", "l")}
+    return {k: v for k, v in refs.items() if v}
+
+
+def history_refs(msgs: list[dict]) -> set[tuple[str, int]]:
+    """历史里各个尾部块引用的编号（循环每轮按它查一次库）。"""
+    return {r for m in msgs if isinstance(m.get("content"), list)
+            for b in m["content"] if is_tail(b) for r in refs_in(b.get("text", ""))}
+
+
+def expand_text(text: str, table: dict) -> str:
+    return REF.sub(lambda x: table.get((x[1], int(x[2])), GONE[x[1]]), text)
+
+
+def expand(msgs: list[dict], table: dict) -> list[dict]:
+    """发出去的副本：尾部块里的占位符换成 table 里的现值，查不到的按「已删除」。不改原列表（要落库的是占位符）。"""
+    return [{**m, "content": [{**b, "text": expand_text(b["text"], table)} if is_tail(b) and REF.search(b["text"])
+                              else b for b in m["content"]]}
+            if m["role"] == "user" and isinstance(m.get("content"), list) and any(is_tail(b) for b in m["content"])
+            else m for m in msgs]
+
+
 def loop_note(kind: str, text: str) -> dict:
     """O7：kind 是 continue（截断续写）或 empty（空回复提醒）。"""
     return {"role": "user", "content": [{"type": "text", "text": LOOP_NOTE.format(kind=kind, text=text)}]}
@@ -68,6 +158,7 @@ def note_kind(m: dict) -> str | None:
     """是循环插的提示就返回 kind，否则 None。只认「整条只有一个以标签开头并闭合的 text 块」。
     用户输入也是单个 text 块，所以光靠格式挡不住伪造：入口（main.py）用 escape_loop_note 把用户打的标签改掉（复核⑥）。"""
     c = m.get("content")
+    c = [b for b in c if not is_tail(b)] if isinstance(c, list) else c  # P5：提示后面可能挂着落库的尾部
     if m.get("role") != "user" or not isinstance(c, list) or len(c) != 1 or c[0].get("type") != "text":
         return None
     t = c[0].get("text", "")
@@ -89,8 +180,8 @@ def is_truncation_reject(m: dict) -> bool:
 
 def text_of(content) -> str:
     if isinstance(content, str):
-        return content
-    return "".join(b.get("text", "") for b in content if b.get("type") == "text")
+        return content  # P5：尾部块不是谁说的话，用户原话、召回、抽记忆、经验查询都不该读到它
+    return "".join(b.get("text", "") for b in content if b.get("type") == "text" and not is_tail(b))
 
 
 def final_answer(messages: list[dict]) -> str:
@@ -120,10 +211,11 @@ def build_request(*, user_name: str, summary: str | None, history: list[dict],
                   now: datetime, final_turn: bool, catalog: str = "",
                   loaded_defs: list[dict] | None = None,
                   persona: str = PERSONA, notes: list[str] | None = None,
-                  instruction: str | None = None, memory_block: str = "") -> tuple[list[dict], list[dict]]:
+                  instruction: str | None = None, memory_block: str = "",
+                  status: str = "", memory: str = "", lessons: str = "") -> tuple[list[dict], list[dict]]:
     """返回 (system blocks, messages)。history 的元素可带 status 字段，这里负责剥掉。
     catalog 是延迟工具名录；loaded_defs 是本会话已加载工具的完整定义；persona 给子智能体换成合同（M7）。
-    notes 是循环给的运行时提示（O6 的重复提醒），拼在尾部最后。
+    notes 是循环给的运行时提示（O6 的重复提醒），拼在尾部最后；status / memory / lessons 按段比对，和历史里最近一次一样就不写（P5）。
     instruction（P1-C1）：压缩摘要请求用，代替层4 的运行时尾部；前面三层和正常请求逐字相同，前缀缓存才能命中。"""
     # 层1：内容固定，最后一轮也不改它，否则后面整段历史的缓存全部失效
     guide = TOOL_GUIDE + (MEMORY_GUIDE if os.getenv("MEMORY", "1") != "0" else "")
@@ -159,10 +251,19 @@ def build_request(*, user_name: str, summary: str | None, history: list[dict],
             msgs.append({"role": "user", "content": [{"type": "text", "text": instruction}]})
         return system, msgs
 
-    # 层4：拼到最后一条 user 的末尾（tool_result 之后放 text 也合法，已实测）
-    tail = (f"---\n当前时间：{now:%Y-%m-%d %H:%M} (UTC{now:%z})" + (FINAL_TURN_NOTE if final_turn else "")
-            + "".join(notes or []))
+    # 层4：拼到最后一条 user 的末尾（tool_result 之后放 text 也合法，已实测）。
+    # P5：循环会把它存回这条消息，下一轮它就是历史的一部分（前缀不再变）；所以已经挂过尾部的（同一轮重试）不再挂
     last = msgs[-1]
-    if last["role"] == "user":  # pause_turn 后最后一条是 assistant：要让模型原样续写，不能插东西
-        msgs[-1] = {"role": "user", "content": _as_blocks(last["content"]) + [{"type": "text", "text": tail}]}
+    if last["role"] != "user" or has_tail(last):  # pause_turn 后最后一条是 assistant：要让模型原样续写，不能插东西
+        return system, msgs
+    shown, wrote, texts = shown_sections(msgs), {}, {}
+    for key, val in (("status", defang(status)), ("memory", memory), ("lessons", lessons)):
+        if val and shown.get(key) != fingerprint(val):  # 空的不写；和历史里最近一次一样也不写
+            wrote[key] = fingerprint(val)
+            texts[key] = val
+    if refs := tail_refs({k: v for k, v in texts.items() if k != "status"}):  # 编号只认代码拼的两段
+        wrote["refs"] = refs
+    tail = (f"---\n当前时间：{now:%Y-%m-%d %H:%M} (UTC{now:%z})" + (FINAL_TURN_NOTE if final_turn else "")
+            + "".join(texts.values()) + "".join(defang(n) for n in notes or []))
+    msgs[-1] = {"role": "user", "content": _as_blocks(last["content"]) + [{"type": "text", "text": tail, TAIL: wrote}]}
     return system, msgs

@@ -23,6 +23,15 @@ async def _said(uid, cid, t):
     return rid, (await db.list_messages(cid))[-1]["id"]
 
 
+
+async def tn(user_id, *args):
+    """P5 复核二：尾部提醒里只有占位符，按发请求时的同一套规则展开再比。"""
+    from app import context, tail_refs
+    notes = await mt.tail_notes(user_id, *args)
+    keys = set().union(*(context.refs_in(n) for n in notes)) if notes else set()
+    table = await tail_refs.lookup(user_id, keys) if keys else {}
+    return [context.expand_text(n, table) for n in notes]
+
 def test_render_block_newest_first_and_capped():
     now = datetime(2026, 11, 13)
     items = [{"id": i, "content": f"用户的第 {i} 条偏好：" + "很长的说明" * 10, "created_at": now}
@@ -166,13 +175,13 @@ def test_tail_notes_name_stale_block_items():
         veg, home, dark = await put(alice, "用户是素食者"), await put(alice, "用户住北京"), await put(alice, "用户喜欢深色主题")
         bobs = await put(bob, "bob 的秘密")
         block = mt.render_block(await ms.active(alice, source="user_stated")) + f"[#{bobs}]"  # 混进别人的编号
-        assert await mt.tail_notes(alice, block) == [mt.SNAPSHOT_NOTE]       # 都还有效：只有快照提醒
-        assert await mt.tail_notes(alice, "") == []                          # 没有摘要块：什么都不加
+        assert await tn(alice, block) == [mt.SNAPSHOT_NOTE]       # 都还有效：只有快照提醒
+        assert await tn(alice, "") == []                          # 没有摘要块：什么都不加
         meat = await put(alice, "用户不吃素了", [veg])
         await put(alice, "用户开始吃肉，想多补蛋白质", [meat])               # 连着取代两次：找到现在有效的那条
         await ms.revoke(alice, home, actor="user")
         await ms.revoke(bob, bobs, actor="user")
-        notes = await mt.tail_notes(alice, block)
+        notes = await tn(alice, block)
         assert notes[0] == mt.SNAPSHOT_NOTE and len(notes) == 3
         assert f"记忆 #{veg}「用户是素食者」已被 #{meat + 1} 取代：用户开始吃肉，想多补蛋白质" in notes[1]
         assert f"记忆 #{home}「用户住北京」已被用户撤销" in notes[2]
@@ -194,7 +203,7 @@ def test_tail_echoes_items_written_in_this_conversation():
         veg = await put("用户是素食者", source="user_stated")
         old = await put("用户住北京", run_id=r1, source="user_stated")       # 也是本对话写的，但已经在摘要块里
         block = mt.render_block(await ms.active(alice, source="user_stated"))
-        assert await mt.tail_notes(alice, block, c1) == [mt.SNAPSHOT_NOTE]   # 没有新东西：不回显
+        assert await tn(alice, block, c1) == [mt.SNAPSHOT_NOTE]   # 没有新东西：不回显
         meat = await put("用户不再吃素", run_id=r1)                          # 模型当场记下的推断，没能作废旧条目
         await put("别的对话里记的", run_id=r2)
         bob = await db.create_user("bob", "tok-b")                           # 正常流程不会出现；库不拦，所以查询自己要带 user_id
@@ -202,17 +211,17 @@ def test_tail_echoes_items_written_in_this_conversation():
                      evidence=[], actor="agent", run_id=r1)
         gone = await put("记了又撤销的", run_id=r1)
         await ms.revoke(alice, gone, actor="user")
-        notes = await mt.tail_notes(alice, block, c1)
+        notes = await tn(alice, block, c1)
         assert notes == [mt.SNAPSHOT_NOTE, mt.ECHO_HEAD + f"\n- [#{meat}] 用户不再吃素"]   # 只有本对话的、有效的、块里没有的
-        assert await mt.tail_notes(alice, block) == [mt.SNAPSHOT_NOTE]       # 不给会话 id：不回显
-        assert await mt.tail_notes(alice, "", c1) == []                      # 没有摘要块：什么都不加
+        assert await tn(alice, block) == [mt.SNAPSHOT_NOTE]       # 不给会话 id：不回显
+        assert await tn(alice, "", c1) == []                      # 没有摘要块：什么都不加
         # 抽取做完、正式取代了块里的条目：在「点名」里出现一次，回显里不重复
         new = await put("用户开始吃肉", run_id=r1, source="user_stated", sup=[veg])
-        notes = await mt.tail_notes(alice, block, c1)
+        notes = await tn(alice, block, c1)
         assert f"已被 #{new} 取代：用户开始吃肉" in notes[1] and f"[#{new}]" not in notes[2] and f"[#{meat}]" in notes[2]
         # 最多回显 5 条，留最新的，按先后顺序
         more = [await put(f"第 {i} 条", run_id=r1) for i in range(6)]
-        echo = (await mt.tail_notes(alice, block, c1))[2]
+        echo = (await tn(alice, block, c1))[2]
         assert [f"[#{i}]" in echo for i in [meat, *more]] == [False, False, True, True, True, True, True]
         assert echo.index(f"[#{more[1]}]") < echo.index(f"[#{more[5]}]")
         assert old not in more and f"[#{old}]" not in echo

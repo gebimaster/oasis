@@ -341,7 +341,10 @@ def test_single_round_compaction_persists_and_restores(monkeypatch):
         cp = await db.get_compaction(cid)
         rows = {m["id"]: m for m in await db.list_messages(cid)}
         assert cp["revision"] >= 1
-        assert cp["replay_prefix"] == [{"role": "user", "content": q1}]       # Q 原样存了一份
+        q_row = next(m for m in rows.values() if m["role"] == "user")
+        # Q 原样存了一份。P5：Q 第一轮发出去时挂了尾部、尾部已存回 Q，副本要和库里的 Q 逐字相同（前缀才对得上）
+        assert cp["replay_prefix"] == [{"role": "user", "content": q_row["content"]}]
+        assert q_row["content"][:1] == q1 and "_tail" in q_row["content"][-1]
         cursor = rows[cp["keep_from_id"]]
         assert cursor["role"] == "assistant" and cursor["run_id"] == run1    # 游标指向本 run 新产生的消息
         assert (await db.get_run(run1))["status"] == "completed"
@@ -354,7 +357,7 @@ def test_single_round_compaction_persists_and_restores(monkeypatch):
         await runner._run(cid, run2, model_stream=stream, limits={"trigger": 10**9, "target": 10**9})
         sent = calls[n_before]["messages"]
         assert sent[1]["content"].startswith("<summary>\n" + cp["summary"])
-        assert sent[2] == {"role": "user", "content": q1}                    # 摘要 → Q 副本 → 游标之后
+        assert sent[2] == {"role": "user", "content": q_row["content"]}  # P5：带着它当时的尾部                    # 摘要 → Q 副本 → 游标之后
         assert sent[3]["content"] == cursor["content"]
         assert compaction.pairs_ok(sent[2:])
         assert (await db.get_run(run2))["status"] == "completed"

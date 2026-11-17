@@ -127,7 +127,7 @@ def test_context_budget_forces_final_turn():
         return [ev async for ev in run_loop([{"role": "user", "content": "算 1+2"}], model_stream=with_usage,
                                             max_turns=6, context_limit=20000)]
     evs = asyncio.run(go())
-    assert calls[1]["tool_choice"] == {"type": "none"}
+    assert calls[1]["tool_choice"]["type"] == "none"
     assert context.FINAL_TURN_NOTE.strip() in str(calls[1]["messages"][-1])
     assert evs[-1] == {"type": "run_end", "status": "completed", "stop_reason": "budget"}
     text = subagent.render([{"title": "算", "status": "completed", "started": True, "text": "结论：3",
